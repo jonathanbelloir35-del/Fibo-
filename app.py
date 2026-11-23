@@ -814,6 +814,13 @@ def ecran_scanner():
     )
     st.caption(f"Dernière semaine de données : {cours.index[-1]:%d/%m/%Y}. Données mises en cache 24 h.")
 
+    # Ouvrir la fiche détaillée (timing d'achat) d'une action du tableau
+    if not tableau.empty:
+        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+        choix = c1.selectbox("Voir la fiche de", tableau["Ticker"],
+                             format_func=lambda t: f"{t} — {composants.get(t, t)}")
+        c2.button("📋 Ouvrir", on_click=ouvrir_fiche, args=(choix,), width="stretch")
+
     if ignorees:
         with st.expander(f"Actions ignorées ({len(ignorees)})"):
             st.caption(f"Il faut au moins {PERIODE_WMA} semaines de cours pour calculer la 200 WMA.")
@@ -1045,16 +1052,301 @@ def ecran_portefeuille():
 
 
 # ---------------------------------------------------------------------------
-# Navigation entre les deux écrans
+# Écran 3 : Fiche action (timing d'achat + score qualité)
+# ---------------------------------------------------------------------------
+# Le timing d'achat répond à 3 questions :
+#   1. Contexte     : la tendance de fond est-elle saine ?
+#   2. Zone         : le cours est-il sur un niveau d'achat intéressant ?
+#                     (retracement de Fibonacci 38,2 %–61,8 % de la dernière hausse, ou 200 WMA)
+#   3. Confirmation : le rebond a-t-il commencé ?
+
+ECRAN_FICHE = "📋 Fiche action"
+FIBO_HAUT, FIBO_MILIEU, FIBO_BAS = 0.382, 0.5, 0.618  # niveaux de retracement
+
+
+def rsi(serie, periode=14):
+    """RSI (Relative Strength Index) de Wilder : 0 à 100. Sous 30 = survendu, au-dessus de 70 = suracheté."""
+    variation = serie.diff()
+    hausses = variation.clip(lower=0).ewm(alpha=1 / periode, adjust=False).mean()
+    baisses = (-variation.clip(upper=0)).ewm(alpha=1 / periode, adjust=False).mean()
+    return 100 - 100 / (1 + hausses / baisses)
+
+
+def derniere_jambe_haussiere(pivots, provisoire):
+    """Dernière hausse du ZigZag : (creux de départ, sommet). Le sommet peut être provisoire."""
+    points = pivots + ([provisoire] if provisoire else [])
+    for k in range(len(points) - 2, -1, -1):
+        if points[k]["type"] == "creux" and points[k + 1]["type"] == "sommet":
+            return points[k], points[k + 1]
+    return None
+
+
+def analyse_timing(serie, seuil):
+    """Analyse technique du moment d'achat. Renvoie un dictionnaire avec tous les éléments."""
+    prix = serie.iloc[-1]
+    wma = serie.rolling(PERIODE_WMA).mean()
+    mm10 = serie.rolling(10).mean()
+    indice_rsi = rsi(serie)
+    pivots, provisoire = zigzag(serie, seuil)
+    controles = []  # liste de (groupe, nom, ok True/False/None, détail)
+
+    # --- 1. Contexte ---
+    if wma.notna().sum() > 20:
+        ok = wma.iloc[-1] > wma.iloc[-21]
+        controles.append(("Contexte", "200 WMA en hausse", ok,
+                          f"{wma.iloc[-21]:.2f} il y a 20 semaines → {wma.iloc[-1]:.2f} aujourd'hui"))
+    else:
+        controles.append(("Contexte", "200 WMA en hausse", None, "Historique trop court"))
+
+    creux = [p for p in pivots if p["type"] == "creux"]
+    if len(creux) >= 2:
+        ok = creux[-1]["prix"] > creux[-2]["prix"]
+        controles.append(("Contexte", "Creux de plus en plus hauts", ok,
+                          f"{creux[-2]['prix']:.2f} ({creux[-2]['date']:%m/%Y}) → "
+                          f"{creux[-1]['prix']:.2f} ({creux[-1]['date']:%m/%Y})"))
+    else:
+        controles.append(("Contexte", "Creux de plus en plus hauts", None, "Pas assez de creux avec ce seuil"))
+
+    # --- 2. Zone d'achat ---
+    jambe = derniere_jambe_haussiere(pivots, provisoire)
+    zone = None
+    dans_fibo = False
+    if jambe:
+        a, b = jambe
+        hausse = b["prix"] - a["prix"]
+        zone = {
+            "depart": a, "sommet": b,
+            "haut": b["prix"] - FIBO_HAUT * hausse,
+            "milieu": b["prix"] - FIBO_MILIEU * hausse,
+            "bas": b["prix"] - FIBO_BAS * hausse,
+        }
+        dans_fibo = zone["bas"] <= prix <= zone["haut"]
+        controles.append(("Zone", "Dans le retracement de Fibonacci 38,2–61,8 %", dans_fibo,
+                          f"Zone {zone['bas']:.2f} – {zone['haut']:.2f} "
+                          f"(hausse de {a['prix']:.2f} à {b['prix']:.2f})"))
+    else:
+        controles.append(("Zone", "Dans le retracement de Fibonacci 38,2–61,8 %", None,
+                          "Pas de hausse détectée avec ce seuil"))
+
+    ecart_wma = None
+    pres_wma = False
+    if pd.notna(wma.iloc[-1]):
+        ecart_wma = (prix / wma.iloc[-1] - 1) * 100
+        pres_wma = abs(ecart_wma) <= 5
+        controles.append(("Zone", "Proche de la 200 WMA (± 5 %)", pres_wma, f"Écart {ecart_wma:+.1f} %"))
+    else:
+        controles.append(("Zone", "Proche de la 200 WMA (± 5 %)", None, "Moins de 200 semaines d'historique"))
+
+    en_zone = dans_fibo or pres_wma
+
+    # --- 3. Confirmation du rebond ---
+    au_dessus_mm10 = prix > mm10.iloc[-1]
+    controles.append(("Confirmation", "Clôture au-dessus de la moyenne 10 semaines", au_dessus_mm10,
+                      f"Cours {prix:.2f} / moyenne 10 sem. {mm10.iloc[-1]:.2f}"))
+    rsi_hausse = indice_rsi.iloc[-1] > indice_rsi.iloc[-3]
+    detail_rsi = f"RSI {indice_rsi.iloc[-3]:.0f} il y a 2 semaines → {indice_rsi.iloc[-1]:.0f}"
+    if indice_rsi.iloc[-1] < 30:
+        detail_rsi += " (survendu)"
+    elif indice_rsi.iloc[-1] > 70:
+        detail_rsi += " (suracheté)"
+    controles.append(("Confirmation", "RSI hebdomadaire en hausse", rsi_hausse, detail_rsi))
+    confirme = au_dessus_mm10 and rsi_hausse
+
+    # --- Feu tricolore ---
+    if en_zone and confirme:
+        feu = "🟢 Zone d'achat + rebond confirmé"
+    elif en_zone:
+        feu = "🟡 Dans la zone : attendre la confirmation du rebond"
+    elif zone and prix > zone["haut"]:
+        feu = "⚪ Au-dessus de la zone : attendre un repli"
+    elif zone and prix > zone["depart"]["prix"]:
+        feu = "🟠 Sous la zone 61,8 % : rebond fragile, prudence"
+    else:
+        feu = "🔴 Sous le creux de départ : la hausse précédente est effacée, prudence"
+    tendance_baissiere = controles[0][2] is False
+    if feu.startswith("🟢") and tendance_baissiere:
+        feu = "🟡 Zone + rebond, mais 200 WMA en baisse : prudence"
+
+    # --- Stop de protection : 3 % sous le creux de départ de la dernière hausse ---
+    if zone and prix > zone["depart"]["prix"] * 0.97:
+        stop = zone["depart"]["prix"] * 0.97
+        origine_stop = f"3 % sous le creux du {zone['depart']['date']:%d/%m/%Y}"
+    else:
+        stop = serie.iloc[-10:].min() * 0.97
+        origine_stop = "3 % sous le plus bas des 10 dernières semaines"
+
+    return {
+        "prix": prix, "wma": wma, "mm10": mm10, "rsi": indice_rsi,
+        "pivots": pivots, "provisoire": provisoire, "zone": zone,
+        "ecart_wma": ecart_wma, "controles": controles, "feu": feu,
+        "stop": stop, "origine_stop": origine_stop,
+    }
+
+
+def nom_societe(ticker):
+    """Nom de la société si on le connaît (listes des indices), sinon le ticker."""
+    if ticker in CAC40:
+        return CAC40[ticker]
+    if ticker in NASDAQ100_SECOURS:
+        return NASDAQ100_SECOURS[ticker]
+    try:
+        return liste_sp500().get(ticker, ticker)
+    except Exception:
+        return ticker
+
+
+def graphique_timing(ticker, serie, t):
+    """Graphique : cours, 200 WMA, moyenne 10 semaines, ZigZag, zone d'achat et stop. 5 dernières années."""
+    debut = serie.index[max(0, len(serie) - 260)]  # environ 5 ans
+    visible = serie[serie.index >= debut]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=visible.index, y=visible.values, name="Cours", line=dict(color="#1f77b4")))
+    fig.add_trace(go.Scatter(x=visible.index, y=t["wma"][visible.index].values, name="200 WMA",
+                             line=dict(color="#ff7f0e")))
+    fig.add_trace(go.Scatter(x=visible.index, y=t["mm10"][visible.index].values, name="Moy. 10 sem.",
+                             line=dict(color="gray", width=1, dash="dot")))
+    points = [p for p in t["pivots"] + ([t["provisoire"]] if t["provisoire"] else []) if p["date"] >= debut]
+    if points:
+        fig.add_trace(go.Scatter(x=[p["date"] for p in points], y=[p["prix"] for p in points],
+                                 name="ZigZag", mode="lines+markers",
+                                 line=dict(color="purple", width=1, dash="dash"), marker=dict(size=5)))
+
+    niveaux = list(visible.values) + [t["stop"]]
+    if t["zone"]:
+        z = t["zone"]
+        fig.add_hrect(y0=z["bas"], y1=z["haut"], fillcolor="green", opacity=0.15, line_width=0,
+                      annotation_text="Zone d'achat", annotation_position="top left")
+        niveaux += [z["bas"], z["haut"]]
+    fig.add_hline(y=t["stop"], line=dict(color="red", dash="dash"),
+                  annotation_text=f"Stop {t['stop']:.2f}", annotation_position="bottom left")
+
+    marge = (max(niveaux) - min(niveaux)) * 0.05
+    fig.update_yaxes(range=[min(niveaux) - marge, max(niveaux) + marge])
+    fig.update_layout(title=f"{ticker} — 5 ans", height=420, margin=dict(l=10, r=10, t=40, b=10),
+                      legend=dict(orientation="h", y=-0.15), hovermode="x unified")
+    st.plotly_chart(fig, width="stretch")
+
+    # Petit graphique du RSI (3 dernières années)
+    rsi_visible = t["rsi"].iloc[-156:]
+    fig_rsi = go.Figure(go.Scatter(x=rsi_visible.index, y=rsi_visible.values, name="RSI",
+                                   line=dict(color="#9467bd")))
+    fig_rsi.add_hline(y=70, line=dict(color="red", dash="dot", width=1))
+    fig_rsi.add_hline(y=30, line=dict(color="green", dash="dot", width=1))
+    fig_rsi.update_layout(title="RSI hebdomadaire (14)", height=200, margin=dict(l=10, r=10, t=40, b=10),
+                          yaxis=dict(range=[0, 100]))
+    st.plotly_chart(fig_rsi, width="stretch")
+
+
+def ecran_fiche():
+    st.header(ECRAN_FICHE)
+    st.caption("Timing d'achat (contexte, zone, confirmation) et score qualité d'une action.")
+
+    ticker = st.text_input("Ticker", key="fiche_ticker", placeholder="ex. NVDA, MC.PA, AAPL")
+    ticker = ticker.strip().upper()
+    seuil_pct = st.slider("Seuil du ZigZag (%)", 5, 50, 20, key="fiche_seuil",
+                          help="Plus le seuil est petit, plus le ZigZag repère de petits mouvements.")
+    if not ticker:
+        st.info("Tapez un ticker, ou ouvrez une fiche depuis le Scanner.")
+        return
+
+    with st.spinner(f"Chargement de {ticker}…"):
+        serie = serie_cours(ticker)
+    if len(serie) < 30:
+        st.error(f"Pas assez de données pour {ticker}. Vérifiez le ticker (ex. « MC.PA » pour LVMH).")
+        return
+
+    t = analyse_timing(serie, seuil_pct / 100)
+    st.subheader(f"{nom_societe(ticker)} ({ticker})")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cours", f"{t['prix']:.2f}")
+    c2.metric("200 WMA", f"{t['wma'].iloc[-1]:.2f}" if pd.notna(t["wma"].iloc[-1]) else "—")
+    c3.metric("Écart 200 WMA", f"{t['ecart_wma']:+.1f} %" if t["ecart_wma"] is not None else "—")
+
+    # --- Timing d'achat ---
+    st.markdown("### ⏱️ Timing d'achat")
+    st.markdown(f"#### {t['feu']}")
+    groupe_courant = None
+    for groupe, nom, ok, detail in t["controles"]:
+        if groupe != groupe_courant:
+            st.markdown(f"**{groupe}**")
+            groupe_courant = groupe
+        icone = {True: "✅", False: "❌", None: "➖"}[ok]
+        st.markdown(f"{icone} {nom} — {detail}")
+
+    # Achat en 3 tranches dans la zone de Fibonacci (seulement si le cours n'est pas déjà dessous)
+    if t["zone"] and t["prix"] < t["zone"]["bas"]:
+        st.caption("Le cours est sous la zone de Fibonacci : les tranches d'achat ne s'appliquent pas.")
+    elif t["zone"]:
+        z = t["zone"]
+        st.markdown("**Achat en 3 tranches (suggestion)**")
+        tranches = pd.DataFrame([
+            {"Tranche": "1 (retracement 38,2 %)", "Prix": z["haut"]},
+            {"Tranche": "2 (retracement 50 %)", "Prix": z["milieu"]},
+            {"Tranche": "3 (retracement 61,8 %)", "Prix": z["bas"]},
+        ])
+        tranches["Distance au cours"] = (tranches["Prix"] / t["prix"] - 1) * 100
+        st.dataframe(tranches, hide_index=True, width="stretch", column_config={
+            "Prix": st.column_config.NumberColumn(format="%.2f"),
+            "Distance au cours": st.column_config.NumberColumn(format="%+.1f %%"),
+        })
+
+    # Perte si le stop est touché : depuis le prix moyen des 3 tranches si le cours est au-dessus
+    # de la zone (on n'achèterait que dans la zone), sinon depuis le cours actuel
+    z = t["zone"]
+    if z and t["prix"] > z["haut"]:
+        reference = (z["haut"] + z["milieu"] + z["bas"]) / 3
+        texte_ref = f"au prix moyen des 3 tranches ({reference:.2f})"
+    else:
+        reference = t["prix"]
+        texte_ref = "au cours actuel"
+    perte = (t["stop"] / reference - 1) * 100
+    st.markdown(f"🛑 **Stop de protection suggéré : {t['stop']:.2f}** ({perte:+.1f} % par rapport {texte_ref}) "
+                f"— {t['origine_stop']}.")
+
+    graphique_timing(ticker, serie, t)
+
+    # --- Score qualité ---
+    st.markdown("### 🏅 Score qualité")
+    if not st.toggle("Calculer le score qualité", key=f"fiche_qualite_{ticker}"):
+        st.caption("Télécharge les comptes annuels de l'entreprise (quelques secondes).")
+        return
+    comptes, erreurs = comptes_annuels([ticker])
+    if ticker not in comptes:
+        st.warning(f"Comptes indisponibles ({erreurs.get(ticker, 'erreur inconnue')}). Réessayez dans quelques minutes.")
+        if st.button("🔄 Réessayer", key="fiche_reessayer"):
+            st.rerun()
+        return
+    financiere = ticker in FINANCIERES_CAC40 or (
+        not ticker.endswith(".PA") and ticker in financieres_us("S&P 500")
+    )
+    points, evalues, criteres = score_qualite(comptes[ticker], serie, financiere)
+    st.markdown(f"#### {points}/{evalues} → {verdict(points, evalues)}")
+    for c in criteres:
+        icone = {True: "✅", False: "❌", None: "➖"}[c["ok"]]
+        st.markdown(f"{icone} **{c['nom']}** — {c['detail']}")
+
+
+def ouvrir_fiche(ticker):
+    """Appelé par le bouton du Scanner : bascule vers la fiche de l'action choisie."""
+    st.session_state["ecran"] = ECRAN_FICHE
+    st.session_state["fiche_ticker"] = ticker
+
+
+# ---------------------------------------------------------------------------
+# Navigation entre les écrans
 # ---------------------------------------------------------------------------
 # Des boutons en haut de page plutôt qu'une barre latérale : plus pratique sur iPhone.
 ecran = st.radio(
-    "Écran", ["🔎 Scanner", "💼 Portefeuille"], horizontal=True, label_visibility="collapsed"
+    "Écran", ["🔎 Scanner", "💼 Portefeuille", ECRAN_FICHE],
+    horizontal=True, label_visibility="collapsed", key="ecran",
 )
 
 if ecran == "🔎 Scanner":
     ecran_scanner()
-else:
+elif ecran == "💼 Portefeuille":
     ecran_portefeuille()
+else:
+    ecran_fiche()
 
 st.caption("⚠️ Outil pédagogique, pas un conseil en investissement. Données : Yahoo Finance.")
