@@ -749,14 +749,15 @@ def ecran_scanner():
 
     # Calcul de la 200 WMA pour chaque action
     lignes = []
-    ignorees = 0
+    ignorees = []  # actions écartées, avec la raison
     for ticker, nom in composants.items():
-        if ticker not in cours.columns:
-            ignorees += 1
+        if ticker not in cours.columns or cours[ticker].dropna().empty:
+            ignorees.append({"Ticker": ticker, "Nom": nom, "Raison": "Pas de données Yahoo Finance"})
             continue
         serie = cours[ticker].dropna()
         if len(serie) < PERIODE_WMA:  # pas assez d'historique : on ignore
-            ignorees += 1
+            ignorees.append({"Ticker": ticker, "Nom": nom,
+                             "Raison": f"Seulement {len(serie)} semaines d'historique"})
             continue
         wma = serie.rolling(PERIODE_WMA).mean().iloc[-1]
         prix = serie.iloc[-1]
@@ -782,11 +783,24 @@ def ecran_scanner():
     col1, col2, col3 = st.columns(3)
     col1.metric("Actions analysées", len(tableau))
     col2.metric("Signaux ACHAT", int(nb_achats))
-    col3.metric("Ignorées (< 200 sem.)", ignorees)
+    col3.metric("Ignorées", len(ignorees))
 
     tableau_complet = tableau
     if st.toggle("Afficher seulement les signaux ACHAT"):
         tableau = tableau[tableau["Signal"] != ""]
+
+    # Recherche d'une action par ticker ou par nom
+    recherche = st.text_input("🔍 Rechercher une action (ticker ou nom)", placeholder="ex. NVDA ou Nvidia")
+    if recherche.strip():
+        texte = recherche.strip().lower()
+        tableau = tableau[
+            tableau["Ticker"].str.lower().str.contains(texte, regex=False)
+            | tableau["Nom"].str.lower().str.contains(texte, regex=False)
+        ]
+        if tableau.empty:
+            st.info("Aucune action trouvée dans le tableau (elle est peut-être dans la liste des ignorées, plus bas).")
+
+    st.caption("Tableau trié de l'écart le plus bas au plus haut. Faites glisser le doigt dans le tableau pour voir la suite.")
 
     st.dataframe(
         tableau,
@@ -799,6 +813,11 @@ def ecran_scanner():
         },
     )
     st.caption(f"Dernière semaine de données : {cours.index[-1]:%d/%m/%Y}. Données mises en cache 24 h.")
+
+    if ignorees:
+        with st.expander(f"Actions ignorées ({len(ignorees)})"):
+            st.caption(f"Il faut au moins {PERIODE_WMA} semaines de cours pour calculer la 200 WMA.")
+            st.dataframe(pd.DataFrame(ignorees), hide_index=True, width="stretch")
 
     # Score qualité calculé sur le tableau complet (pas seulement le filtre affiché)
     section_qualite(nom_indice, cours, tableau_complet)
