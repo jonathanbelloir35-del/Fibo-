@@ -1153,16 +1153,17 @@ def analyse_timing(serie, seuil):
     confirme = au_dessus_mm10 and rsi_hausse
 
     # --- Feu tricolore ---
+    # `etat` est un code court, utilisé par l'écran Opportunités
     if en_zone and confirme:
-        feu = "🟢 Zone d'achat + rebond confirmé"
+        etat, feu = "zone_rebond", "🟢 Zone + rebond : le rebond est confirmé"
     elif en_zone:
-        feu = "🟡 Dans la zone : attendre la confirmation du rebond"
+        etat, feu = "zone", "🟡 Zone : dans la zone d'achat, attendre la confirmation du rebond"
     elif zone and prix > zone["haut"]:
-        feu = "⚪ Au-dessus de la zone : attendre un repli"
+        etat, feu = "au_dessus", "⚪ Au-dessus de la zone : attendre un repli"
     elif zone and prix > zone["depart"]["prix"]:
-        feu = "🟠 Sous la zone 61,8 % : rebond fragile, prudence"
+        etat, feu = "sous_zone", "🟠 Sous la zone 61,8 % : rebond fragile, prudence"
     else:
-        feu = "🔴 Sous le creux de départ : la hausse précédente est effacée, prudence"
+        etat, feu = "sous_creux", "🔴 Sous le creux de départ : la hausse précédente est effacée, prudence"
     tendance_baissiere = controles[0][2] is False
     if feu.startswith("🟢") and tendance_baissiere:
         feu = "🟡 Zone + rebond, mais 200 WMA en baisse : prudence"
@@ -1180,6 +1181,7 @@ def analyse_timing(serie, seuil):
         "pivots": pivots, "provisoire": provisoire, "zone": zone,
         "ecart_wma": ecart_wma, "controles": controles, "feu": feu,
         "stop": stop, "origine_stop": origine_stop,
+        "etat": etat, "tendance_baissiere": tendance_baissiere,
     }
 
 
@@ -1279,11 +1281,11 @@ def ecran_fiche():
         st.caption("Le cours est sous la zone de Fibonacci : les tranches d'achat ne s'appliquent pas.")
     elif t["zone"]:
         z = t["zone"]
-        st.markdown("**Achat en 3 tranches (suggestion)**")
+        st.markdown("**Seuils d'achat : achat en 3 tranches (suggestion)**")
         tranches = pd.DataFrame([
-            {"Tranche": "1 (retracement 38,2 %)", "Prix": z["haut"]},
-            {"Tranche": "2 (retracement 50 %)", "Prix": z["milieu"]},
-            {"Tranche": "3 (retracement 61,8 %)", "Prix": z["bas"]},
+            {"Seuil": "Seuil 1 (retracement 38,2 %)", "Prix": z["haut"]},
+            {"Seuil": "Seuil 2 (retracement 50 %)", "Prix": z["milieu"]},
+            {"Seuil": "Seuil 3 (retracement 61,8 %)", "Prix": z["bas"]},
         ])
         tranches["Distance au cours"] = (tranches["Prix"] / t["prix"] - 1) * 100
         st.dataframe(tranches, hide_index=True, width="stretch", column_config={
@@ -1334,11 +1336,176 @@ def ouvrir_fiche(ticker):
 
 
 # ---------------------------------------------------------------------------
+# Écran 4 : Opportunités (analyse technique + fondamentaux)
+# ---------------------------------------------------------------------------
+# Entonnoir :
+#   1. Timing d'achat de toutes les actions de l'indice (rapide : seulement les cours)
+#   2. On garde celles qui sont en « Zone » ou en « Zone + rebond »
+#   3. Score qualité de ces actions-là seulement (lent, donc limité)
+#   4. Décision finale qui combine les deux
+
+ECRAN_OPPORTUNITES = "🎯 Opportunités"
+
+LIBELLES_TIMING = {
+    "zone_rebond": "🟢 Zone + rebond",
+    "zone": "🟡 Zone",
+    "au_dessus": "⚪ Au-dessus",
+    "sous_zone": "🟠 Sous la zone",
+    "sous_creux": "🔴 Sous le creux",
+}
+
+
+def decision(etat, tendance_baissiere, points, evalues):
+    """Combine timing et qualité. Renvoie (libellé, rang pour le tri : plus petit = mieux)."""
+    if evalues is None:
+        return "", 9  # score qualité pas encore calculé
+    if evalues < 3:
+        return "⚪ Données ?", 6
+    ratio = points / evalues
+    if ratio >= 0.8:
+        if etat == "zone_rebond" and not tendance_baissiere:
+            return "🎯 Opportunité", 1
+        return "👀 Surveiller", 2
+    if ratio >= 0.4:
+        return "🟡 Moyenne", 3
+    return "⛔ Prudence", 5
+
+
+@st.cache_data(ttl=CACHE_24H, show_spinner="Analyse technique de toutes les actions…")
+def timings_indice(composants, cours, seuil_pct):
+    """Timing d'achat de chaque action de l'indice. Renvoie un tableau (une ligne par action)."""
+    lignes = []
+    for ticker, nom in composants.items():
+        if ticker not in cours.columns:
+            continue
+        serie = cours[ticker].dropna()
+        if len(serie) < 60:  # un peu plus d'un an d'historique au minimum
+            continue
+        t = analyse_timing(serie, seuil_pct / 100)
+        z = t["zone"]
+        lignes.append({
+            "Ticker": ticker,
+            "Nom": nom,
+            "Cours": t["prix"],
+            "Timing": LIBELLES_TIMING[t["etat"]],
+            "200 WMA ↑": "❌" if t["tendance_baissiere"] else "✅",
+            "Seuil 1": z["haut"] if z else None,
+            "Seuil 2": z["milieu"] if z else None,
+            "Seuil 3": z["bas"] if z else None,
+            "Stop": t["stop"],
+            "_etat": t["etat"],
+            "_baissiere": t["tendance_baissiere"],
+        })
+    return pd.DataFrame(lignes)
+
+
+def ecran_opportunites():
+    st.header(ECRAN_OPPORTUNITES)
+    st.caption(
+        "Combine l'analyse technique (le bon moment) et les fondamentaux (la bonne entreprise). "
+        "**Zone** = le cours est dans la zone d'achat. **Zone + rebond** = il y est ET le rebond a commencé. "
+        "**Seuils 1, 2, 3** = prix d'achat des 3 tranches (retracements 38,2 %, 50 %, 61,8 %)."
+    )
+
+    nom_indice = st.radio("Indice", ["CAC 40", "Nasdaq 100", "S&P 500"], horizontal=True, key="opp_indice")
+    seuil_pct = st.slider("Seuil du ZigZag (%)", 5, 50, 20, key="opp_seuil")
+
+    with st.spinner("Téléchargement des cours…"):
+        composants = composants_indice(nom_indice)
+        cours = cours_hebdo(tuple(sorted(composants)))
+    if cours.empty:
+        st.error("Impossible de récupérer les cours. Réessayez plus tard.")
+        return
+
+    # --- 1. Timing d'achat de toutes les actions (gardé en cache : calcul long sur le S&P 500) ---
+    tableau = timings_indice(composants, cours, seuil_pct)
+    if tableau.empty:
+        st.warning("Aucune action analysable.")
+        return
+
+    nb_rebond = (tableau["_etat"] == "zone_rebond").sum()
+    nb_zone = (tableau["_etat"] == "zone").sum()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Analysées", len(tableau))
+    c2.metric("🟢 Zone + rebond", int(nb_rebond))
+    c3.metric("🟡 Zone", int(nb_zone))
+
+    # --- 2. On garde les actions en zone d'achat ---
+    tout_afficher = st.toggle("Afficher aussi les actions hors zone", key="opp_tout")
+    en_zone = tableau[tableau["_etat"].isin(["zone_rebond", "zone"])]
+    affiche = tableau if tout_afficher else en_zone
+
+    # --- 3. Score qualité des actions en zone ---
+    qualite_active = not en_zone.empty and st.toggle(
+        f"Calculer le score qualité des {len(en_zone)} actions en zone", key=f"opp_qualite_{nom_indice}"
+    )
+    scores = {}
+    if qualite_active:
+        comptes, erreurs = comptes_annuels(list(en_zone["Ticker"]))
+        if erreurs:
+            st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : Yahoo limite sans doute les "
+                       "requêtes. Patientez quelques minutes puis appuyez sur « Réessayer ».")
+            if st.button("🔄 Réessayer", key="opp_reessayer"):
+                st.rerun()
+        for _, ligne in en_zone.iterrows():
+            t = ligne["Ticker"]
+            if t in comptes:
+                points, evalues, _ = score_qualite(comptes[t], cours[t].dropna(), est_financiere(t, nom_indice))
+                scores[t] = (points, evalues)
+    elif not en_zone.empty:
+        st.caption("Activez le score qualité pour obtenir la décision finale (premier calcul : quelques minutes).")
+
+    # --- 4. Décision finale ---
+    affiche = affiche.copy()
+    qualites, decisions, rangs = [], [], []
+    for _, ligne in affiche.iterrows():
+        points, evalues = scores.get(ligne["Ticker"], (None, None))
+        libelle, rang = decision(ligne["_etat"], ligne["_baissiere"], points, evalues)
+        qualites.append(f"{points}/{evalues}" if evalues is not None else "")
+        decisions.append(libelle)
+        rangs.append(rang)
+    affiche["Qualité"] = qualites
+    affiche["Décision"] = decisions
+    affiche["_rang"] = rangs
+    ordre_timing = {"zone_rebond": 0, "zone": 1, "au_dessus": 2, "sous_zone": 3, "sous_creux": 4}
+    affiche["_ordre"] = affiche["_etat"].map(ordre_timing)
+    affiche = affiche.sort_values(["_rang", "_ordre", "Ticker"])
+
+    if affiche.empty:
+        st.info("Aucune action en zone d'achat pour le moment. Activez « Afficher aussi les actions hors zone ».")
+        return
+
+    # Colonnes les plus utiles en premier (l'écran d'un iPhone est étroit)
+    colonnes = ["Ticker", "Décision", "Timing", "Cours", "Seuil 1", "Seuil 2", "Seuil 3",
+                "Stop", "Qualité", "200 WMA ↑", "Nom"]
+    format_prix = st.column_config.NumberColumn(format="%.2f")
+    config = {c: format_prix for c in ["Cours", "Seuil 1", "Seuil 2", "Seuil 3", "Stop"]}
+    config["Ticker"] = st.column_config.TextColumn(pinned=True)  # reste visible pendant le défilement
+    config["Décision"] = st.column_config.TextColumn(width="medium")  # libellé lisible en entier
+    st.dataframe(affiche[colonnes], hide_index=True, width="stretch", column_config=config)
+    st.markdown(
+        "**Décision**  \n"
+        "🎯 **Opportunité** : Zone + rebond, 200 WMA en hausse et qualité ≥ 80 %  \n"
+        "👀 **Surveiller** : bonne qualité (≥ 80 %), mais rebond pas encore confirmé ou 200 WMA en baisse  \n"
+        "🟡 **Moyenne** : qualité entre 40 et 79 %  \n"
+        "⛔ **Prudence** : fondamentaux fragiles (qualité < 40 %)  \n"
+        "⚪ **Données ?** : moins de 3 critères qualité disponibles"
+    )
+    st.caption("Faites glisser le tableau vers la droite pour voir toutes les colonnes.")
+
+    # Ouvrir la fiche détaillée
+    c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+    choix = c1.selectbox("Voir la fiche de", affiche["Ticker"],
+                         format_func=lambda t: f"{t} — {composants.get(t, t)}", key="opp_choix")
+    c2.button("📋 Ouvrir", on_click=ouvrir_fiche, args=(choix,), width="stretch", key="opp_ouvrir")
+
+
+# ---------------------------------------------------------------------------
 # Navigation entre les écrans
 # ---------------------------------------------------------------------------
 # Des boutons en haut de page plutôt qu'une barre latérale : plus pratique sur iPhone.
 ecran = st.radio(
-    "Écran", ["🔎 Scanner", "💼 Portefeuille", ECRAN_FICHE],
+    "Écran", ["🔎 Scanner", ECRAN_OPPORTUNITES, ECRAN_FICHE, "💼 Portefeuille"],
     horizontal=True, label_visibility="collapsed", key="ecran",
 )
 
@@ -1346,6 +1513,8 @@ if ecran == "🔎 Scanner":
     ecran_scanner()
 elif ecran == "💼 Portefeuille":
     ecran_portefeuille()
+elif ecran == ECRAN_OPPORTUNITES:
+    ecran_opportunites()
 else:
     ecran_fiche()
 
