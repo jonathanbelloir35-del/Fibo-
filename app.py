@@ -8,7 +8,8 @@ Application Streamlit : Scanner 200 WMA + Portefeuille avec objectifs Fibonacci.
 Lancer en local :  streamlit run app.py
 """
 
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 
 import pandas as pd
@@ -303,102 +304,146 @@ def objectif_vente(a, b, c):
 # 5 critères, 1 point chacun :
 #   1. Croissance du chiffre d'affaires   2. Rentabilité (ROE et marge)
 #   3. Free cash flow positif             4. Endettement raisonnable
-#   5. PER inférieur ou égal à la médiane de son secteur
+#   5. PER actuel inférieur ou égal à son PER moyen des années précédentes
 # Un critère sans données (ou non applicable, ex. la dette pour une banque)
 # n'est pas compté : le score s'affiche alors sur 4 ou sur 3.
+#
+# Toutes les données viennent des comptes annuels publiés (environ 4 ans),
+# téléchargés UNIQUEMENT pour les actions ayant un signal ACHAT, doucement
+# (3 à la fois) pour ne pas être bloqué par Yahoo Finance.
 
 # Seuils des critères (modifiables)
 CROISSANCE_CA_MIN = 0.05  # croissance annuelle moyenne du CA : 5 %
 ROE_MIN = 0.12  # rentabilité des capitaux propres : 12 %
 DETTE_EBITDA_MAX = 2.5  # dette nette / EBITDA
-SECTEURS_FINANCIERS = {"Financial Services"}  # banques, assurances : dette et FCF non pertinents
 
-# Champs de Yahoo Finance que l'on garde
-CHAMPS_INFO = [
-    "sector", "trailingPE", "trailingEps", "returnOnEquity",
-    "totalDebt", "totalCash", "ebitda",
-]
+# Banques et assurances du CAC 40 (pour elles, dette et free cash flow ne veulent rien dire)
+FINANCIERES_CAC40 = {"BNP.PA", "ACA.PA", "GLE.PA", "CS.PA"}
 
 
-def _info_ticker(ticker):
-    """Infos générales d'une action (secteur, PER, ROE, dette…). {} en cas d'erreur."""
+@st.cache_data(ttl=CACHE_24H, show_spinner=False)
+def financieres_us(nom_indice):
+    """Liste des tickers du secteur financier (Nasdaq 100 / S&P 500), lue sur Wikipédia."""
+    sources = {
+        "Nasdaq 100": ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker"),
+        "S&P 500": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
+    }
+    url, colonne_ticker = sources[nom_indice]
     try:
-        info = yf.Ticker(ticker).info or {}
-        return {champ: info.get(champ) for champ in CHAMPS_INFO}
+        reponse = requests.get(url, headers=ENTETES_HTTP, timeout=20)
+        for tableau in pd.read_html(StringIO(reponse.text)):
+            colonnes_secteur = [c for c in tableau.columns if "Sector" in str(c) or "Industry" in str(c)]
+            if colonne_ticker in tableau.columns and colonnes_secteur and len(tableau) > 50:
+                secteur = tableau[colonnes_secteur[0]].astype(str)
+                tickers = tableau[colonne_ticker].astype(str).str.replace(".", "-", regex=False)
+                return set(tickers[secteur.str.contains("Financ")])
     except Exception:
-        return {}
+        pass
+    return set()
 
 
-def _ligne_comptable(tableau, noms):
-    """Extrait une ligne d'un état financier, des années les plus anciennes aux plus récentes."""
+def est_financiere(ticker, nom_indice):
+    if nom_indice == "CAC 40":
+        return ticker in FINANCIERES_CAC40
+    return ticker in financieres_us(nom_indice)
+
+
+def _serie_comptable(tableau, noms):
+    """Extrait une ligne d'un état financier : Series {date de clôture: valeur}, de la plus ancienne à la plus récente."""
     if tableau is None or tableau.empty:
-        return []
+        return pd.Series(dtype=float)
     for nom in noms:
         if nom in tableau.index:
-            ligne = pd.to_numeric(tableau.loc[nom], errors="coerce").dropna().sort_index()
-            return [float(v) for v in ligne.values]
-    return []
+            return pd.to_numeric(tableau.loc[nom], errors="coerce").dropna().sort_index()
+    return pd.Series(dtype=float)
 
 
-def _etats_ticker(ticker):
-    """Chiffre d'affaires, résultat opérationnel et free cash flow annuels (~4 ans)."""
-    try:
-        action = yf.Ticker(ticker)
-        compte = action.income_stmt
-        flux = action.cashflow
-        return {
-            "ca": _ligne_comptable(compte, ["Total Revenue", "Operating Revenue"]),
-            "resultat_op": _ligne_comptable(compte, ["Operating Income"]),
-            "fcf": _ligne_comptable(flux, ["Free Cash Flow"]),
-        }
-    except Exception:
-        return {"ca": [], "resultat_op": [], "fcf": []}
+def _valeurs(serie):
+    return [float(v) for v in serie.values]
 
 
-def _en_parallele(fonction, tickers):
-    """Appelle `fonction` pour chaque ticker, 8 à la fois (beaucoup plus rapide)."""
-    with ThreadPoolExecutor(max_workers=8) as executeur:
-        return dict(zip(tickers, executeur.map(fonction, tickers)))
+def _telecharger_comptes(ticker):
+    """Télécharge les comptes annuels d'une action, avec 3 tentatives.
+
+    Renvoie (donnees, None) si tout va bien, ou (None, message_d_erreur).
+    """
+    erreur = "réponse vide de Yahoo Finance"
+    for tentative in range(3):
+        try:
+            action = yf.Ticker(ticker)
+            compte = action.income_stmt
+            if compte is None or compte.empty:
+                raise ValueError("compte de résultat vide (Yahoo limite peut-être les requêtes)")
+            bilan = action.balance_sheet
+            flux = action.cashflow
+            bpa = _serie_comptable(compte, ["Diluted EPS", "Basic EPS"])
+            donnees = {
+                "ca": _valeurs(_serie_comptable(compte, ["Total Revenue", "Operating Revenue"])),
+                "resultat_op": _valeurs(_serie_comptable(compte, ["Operating Income"])),
+                "resultat_net": _valeurs(_serie_comptable(compte, ["Net Income", "Net Income Common Stockholders"])),
+                "ebitda": _valeurs(_serie_comptable(compte, ["EBITDA", "Normalized EBITDA"])),
+                "bpa": {str(d.date()): float(v) for d, v in bpa.items()},  # bénéfice par action par année
+                "capitaux_propres": _valeurs(_serie_comptable(bilan, ["Stockholders Equity", "Common Stock Equity"])),
+                "dette": _valeurs(_serie_comptable(bilan, ["Total Debt"])),
+                "tresorerie": _valeurs(_serie_comptable(
+                    bilan, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])),
+                "fcf": _valeurs(_serie_comptable(flux, ["Free Cash Flow"])),
+            }
+            return donnees, None
+        except Exception as e:
+            erreur = str(e) or e.__class__.__name__
+            time.sleep(2 + 3 * tentative)  # on patiente un peu plus à chaque essai
+    return None, erreur
 
 
-@st.cache_data(ttl=CACHE_24H, show_spinner=False)
-def infos_indice(tickers):
-    """Infos générales de toutes les actions de l'indice (pour la médiane des PER par secteur)."""
-    return _en_parallele(_info_ticker, list(tickers))
+@st.cache_resource(show_spinner=False)
+def _memoire_comptes():
+    """Mémoire partagée {ticker: (heure, données)} : on n'y garde QUE les réussites."""
+    return {}
 
 
-@st.cache_data(ttl=CACHE_24H, show_spinner=False)
-def etats_financiers(tickers):
-    """États financiers des actions demandées (seulement les candidats, car c'est lent)."""
-    return _en_parallele(_etats_ticker, list(tickers))
+def comptes_annuels(tickers):
+    """Comptes des actions demandées. Renvoie (resultats, erreurs).
+
+    Les réussites sont gardées 24 h ; les échecs seront retentés au prochain affichage.
+    """
+    memoire = _memoire_comptes()
+    maintenant = time.time()
+    resultats, erreurs = {}, {}
+    a_telecharger = []
+    for t in tickers:
+        if t in memoire and maintenant - memoire[t][0] < CACHE_24H:
+            resultats[t] = memoire[t][1]
+        else:
+            a_telecharger.append(t)
+
+    if a_telecharger:
+        barre = st.progress(0.0, text="Téléchargement des comptes annuels…")
+        # 3 téléchargements à la fois seulement, pour ne pas être bloqué par Yahoo
+        with ThreadPoolExecutor(max_workers=3) as executeur:
+            taches = {executeur.submit(_telecharger_comptes, t): t for t in a_telecharger}
+            for n, tache in enumerate(as_completed(taches), start=1):
+                t = taches[tache]
+                donnees, erreur = tache.result()
+                if donnees is not None:
+                    memoire[t] = (time.time(), donnees)
+                    resultats[t] = donnees
+                else:
+                    erreurs[t] = erreur
+                barre.progress(n / len(a_telecharger), text=f"Comptes annuels : {n}/{len(a_telecharger)}")
+        barre.empty()
+    return resultats, erreurs
 
 
-def medianes_per(infos):
-    """PER médian de chaque secteur (au moins 3 entreprises bénéficiaires)."""
-    lignes = [
-        {"secteur": i.get("sector"), "per": i.get("trailingPE")}
-        for i in infos.values()
-        if i.get("sector") and isinstance(i.get("trailingPE"), (int, float))
-        and 0 < i["trailingPE"] < 300  # on écarte les valeurs aberrantes
-    ]
-    if not lignes:
-        return {}
-    df = pd.DataFrame(lignes)
-    comptes = df.groupby("secteur")["per"].count()
-    medianes = df.groupby("secteur")["per"].median()
-    return {s: m for s, m in medianes.items() if comptes[s] >= 3}
-
-
-def score_qualite(info, etats, mediane_secteur):
+def score_qualite(comptes, cours, financiere):
     """Évalue les 5 critères. Renvoie (points, nb_criteres_evalues, liste_des_criteres).
 
     Chaque critère est un dict : nom, ok (True / False / None si non évaluable), détail.
     """
     criteres = []
-    financier = info.get("sector") in SECTEURS_FINANCIERS
 
     # 1. Croissance du chiffre d'affaires
-    ca = etats.get("ca", [])[-4:]
+    ca = comptes["ca"][-4:]
     if len(ca) >= 2 and ca[0] > 0:
         annees = len(ca) - 1
         croissance_moy = (ca[-1] / ca[0]) ** (1 / annees) - 1
@@ -412,25 +457,27 @@ def score_qualite(info, etats, mediane_secteur):
     else:
         criteres.append({"nom": "Croissance du chiffre d'affaires", "ok": None, "detail": "Données absentes"})
 
-    # 2. Rentabilité : ROE suffisant et marge opérationnelle qui ne se dégrade pas
-    roe = info.get("returnOnEquity")
-    res_op = etats.get("resultat_op", [])
-    tout_ca = etats.get("ca", [])
-    marges = [r / c for r, c in zip(res_op[-2:], tout_ca[-2:]) if c] if len(res_op) >= 2 and len(tout_ca) >= 2 else []
-    if isinstance(roe, (int, float)):
+    # 2. Rentabilité : ROE = résultat net / capitaux propres, et marge opérationnelle stable
+    net, cp = comptes["resultat_net"], comptes["capitaux_propres"]
+    if net and cp and cp[-1] > 0:
+        roe = net[-1] / cp[-1]
         ok = roe >= ROE_MIN
         detail = f"ROE {roe:.1%} (il faut ≥ {ROE_MIN:.0%})"
-        if len(marges) == 2:
+        res_op, tout_ca = comptes["resultat_op"], comptes["ca"]
+        if not financiere and len(res_op) >= 2 and len(tout_ca) >= 2 and tout_ca[-1] and tout_ca[-2]:
+            marges = [res_op[-2] / tout_ca[-2], res_op[-1] / tout_ca[-1]]
             ok = ok and marges[1] >= marges[0] - 0.01  # tolérance d'un point
             detail += f", marge opérationnelle {marges[0]:.1%} → {marges[1]:.1%} (ne doit pas baisser)"
         criteres.append({"nom": "Rentabilité", "ok": ok, "detail": detail})
+    elif net and cp and cp[-1] <= 0:
+        criteres.append({"nom": "Rentabilité", "ok": False, "detail": "Capitaux propres négatifs"})
     else:
         criteres.append({"nom": "Rentabilité", "ok": None, "detail": "Données absentes"})
 
     # 3. Free cash flow positif sur les 2 dernières années
-    fcf = etats.get("fcf", [])[-2:]
-    if financier:
-        criteres.append({"nom": "Free cash flow", "ok": None, "detail": "Non applicable (secteur financier)"})
+    fcf = comptes["fcf"][-2:]
+    if financiere:
+        criteres.append({"nom": "Free cash flow", "ok": None, "detail": "Non applicable (banque / assurance)"})
     elif fcf:
         texte = ", ".join(f"{v / 1e9:+.2f} Md" for v in fcf)
         criteres.append({"nom": "Free cash flow", "ok": all(v > 0 for v in fcf),
@@ -439,32 +486,47 @@ def score_qualite(info, etats, mediane_secteur):
         criteres.append({"nom": "Free cash flow", "ok": None, "detail": "Données absentes"})
 
     # 4. Endettement : dette nette / EBITDA
-    dette, tresorerie, ebitda = info.get("totalDebt"), info.get("totalCash"), info.get("ebitda")
-    if financier:
-        criteres.append({"nom": "Endettement", "ok": None, "detail": "Non applicable (secteur financier)"})
-    elif isinstance(dette, (int, float)):
-        dette_nette = dette - (tresorerie or 0)
+    dette, treso, ebitda = comptes["dette"], comptes["tresorerie"], comptes["ebitda"]
+    if financiere:
+        criteres.append({"nom": "Endettement", "ok": None, "detail": "Non applicable (banque / assurance)"})
+    elif dette or treso:
+        dette_nette = (dette[-1] if dette else 0) - (treso[-1] if treso else 0)
         if dette_nette <= 0:
             criteres.append({"nom": "Endettement", "ok": True, "detail": "Plus de trésorerie que de dettes"})
-        elif isinstance(ebitda, (int, float)) and ebitda > 0:
-            ratio = dette_nette / ebitda
+        elif ebitda and ebitda[-1] > 0:
+            ratio = dette_nette / ebitda[-1]
             criteres.append({"nom": "Endettement", "ok": ratio < DETTE_EBITDA_MAX,
                              "detail": f"Dette nette / EBITDA = {ratio:.1f} (il faut < {DETTE_EBITDA_MAX})"})
-        else:
+        elif ebitda:
             criteres.append({"nom": "Endettement", "ok": False, "detail": "Endettée avec un EBITDA négatif"})
+        else:
+            criteres.append({"nom": "Endettement", "ok": None, "detail": "EBITDA absent"})
     else:
         criteres.append({"nom": "Endettement", "ok": None, "detail": "Données absentes"})
 
-    # 5. PER par rapport à la médiane du secteur
-    per, bpa = info.get("trailingPE"), info.get("trailingEps")
-    if isinstance(bpa, (int, float)) and bpa <= 0:
-        criteres.append({"nom": "PER vs secteur", "ok": False, "detail": "L'entreprise perd de l'argent"})
-    elif isinstance(per, (int, float)) and per > 0 and mediane_secteur:
-        criteres.append({"nom": "PER vs secteur", "ok": per <= mediane_secteur,
-                         "detail": f"PER {per:.1f} contre {mediane_secteur:.1f} pour le secteur "
-                                   f"{info.get('sector')} (doit être ≤)"})
+    # 5. PER actuel vs PER moyen des années précédentes
+    #    PER d'une année = cours à la date de clôture des comptes / bénéfice par action de l'année
+    bpa = pd.Series(comptes["bpa"], dtype=float)
+    bpa.index = pd.to_datetime(bpa.index)
+    bpa = bpa.sort_index()
+    if bpa.empty or cours.empty:
+        criteres.append({"nom": "PER vs son historique", "ok": None, "detail": "Données absentes"})
+    elif bpa.iloc[-1] <= 0:
+        criteres.append({"nom": "PER vs son historique", "ok": False, "detail": "L'entreprise perd de l'argent"})
     else:
-        criteres.append({"nom": "PER vs secteur", "ok": None, "detail": "Données absentes"})
+        per_actuel = cours.iloc[-1] / bpa.iloc[-1]
+        per_passes = []
+        for date, b in bpa.iloc[:-1].items():
+            prix = cours.asof(date)  # cours de la semaine de clôture des comptes
+            if b > 0 and pd.notna(prix):
+                per_passes.append(prix / b)
+        if len(per_passes) >= 2:
+            moyenne = sum(per_passes) / len(per_passes)
+            criteres.append({"nom": "PER vs son historique", "ok": per_actuel <= moyenne,
+                             "detail": f"PER actuel {per_actuel:.1f} contre {moyenne:.1f} en moyenne "
+                                       f"les {len(per_passes)} années précédentes (doit être ≤)"})
+        else:
+            criteres.append({"nom": "PER vs son historique", "ok": None, "detail": "Historique trop court"})
 
     evalues = [c for c in criteres if c["ok"] is not None]
     points = sum(1 for c in evalues if c["ok"])
@@ -483,31 +545,43 @@ def verdict(points, evalues):
     return "🔴 Piège possible"
 
 
-def section_qualite(nom_indice, composants, tableau):
+def section_qualite(nom_indice, cours, tableau):
     """Affiche le score qualité des actions ayant un signal ACHAT technique."""
     st.subheader("🏅 Score qualité")
     st.caption(
-        "Vérifie la santé de l'entreprise pour éviter les « pièges » : "
-        "croissance du CA, rentabilité, free cash flow, dette, PER vs secteur."
+        "Vérifie la santé de l'entreprise pour éviter les « pièges » : croissance du CA, "
+        "rentabilité, free cash flow, dette, PER par rapport à son historique."
     )
     candidats = tableau[tableau["Signal"] != ""]
     if candidats.empty:
         st.info("Aucun signal ACHAT technique à analyser.")
         return
     if not st.toggle(f"Calculer le score qualité des {len(candidats)} signaux ACHAT", key=f"qualite_{nom_indice}"):
-        st.caption("Le premier calcul peut prendre 1 à 3 minutes (puis il est gardé 24 h).")
+        st.caption("Le premier calcul peut prendre quelques minutes (puis il est gardé 24 h).")
         return
 
-    with st.spinner("Téléchargement des données financières…"):
-        infos = infos_indice(tuple(sorted(composants)))
-        etats = etats_financiers(tuple(sorted(candidats["Ticker"])))
-    medianes = medianes_per(infos)
+    comptes, erreurs = comptes_annuels(list(candidats["Ticker"]))
+
+    if erreurs:
+        st.warning(
+            f"Données indisponibles pour {len(erreurs)} action(s) sur {len(candidats)}. "
+            "Yahoo Finance limite sans doute le nombre de requêtes : patientez quelques minutes "
+            "puis appuyez sur « Réessayer »."
+        )
+        if st.button("🔄 Réessayer", key=f"reessayer_{nom_indice}"):
+            st.rerun()
+        with st.expander("Détails techniques"):
+            for t, e in erreurs.items():
+                st.text(f"{t} : {e}")
 
     lignes, fiches = [], {}
     for _, ligne in candidats.iterrows():
         t = ligne["Ticker"]
-        info = infos.get(t, {})
-        points, evalues, criteres = score_qualite(info, etats.get(t, {}), medianes.get(info.get("sector")))
+        if t not in comptes:
+            continue
+        points, evalues, criteres = score_qualite(
+            comptes[t], cours[t].dropna(), est_financiere(t, nom_indice)
+        )
         fiches[t] = (ligne["Nom"], points, evalues, criteres)
         lignes.append({
             "Ticker": t,
@@ -517,6 +591,9 @@ def section_qualite(nom_indice, composants, tableau):
             "Verdict": verdict(points, evalues),
             "_tri": points / evalues if evalues >= 3 else -1,  # données insuffisantes en bas
         })
+
+    if not lignes:
+        return
 
     resultat = pd.DataFrame(lignes).sort_values(["_tri", "Écart %"], ascending=[False, True])
     st.dataframe(
@@ -618,7 +695,7 @@ def ecran_scanner():
     st.caption(f"Dernière semaine de données : {cours.index[-1]:%d/%m/%Y}. Données mises en cache 24 h.")
 
     # Score qualité calculé sur le tableau complet (pas seulement le filtre affiché)
-    section_qualite(nom_indice, composants, tableau_complet)
+    section_qualite(nom_indice, cours, tableau_complet)
 
 
 # ---------------------------------------------------------------------------
