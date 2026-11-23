@@ -86,24 +86,118 @@ CAC40 = {
 }
 
 # Liste de secours pour le Nasdaq 100 (utilisée seulement si Wikipédia est inaccessible).
-NASDAQ100_SECOURS = [
-    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
-    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AXON", "AZN", "BIIB", "BKNG",
-    "BKR", "CCEP", "CDNS", "CDW", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD",
-    "CSCO", "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DXCM", "EA", "EXC",
-    "FANG", "FAST", "FTNT", "GEHC", "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX",
-    "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "LULU", "MAR",
-    "MCHP", "MDB", "MDLZ", "MELI", "META", "MNST", "MRVL", "MSFT", "MSTR", "MU",
-    "NFLX", "NVDA", "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR", "PDD",
-    "PEP", "PLTR", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX", "SNPS", "TEAM",
-    "TMUS", "TSLA", "TTD", "TTWO", "TXN", "VRSK", "VRTX", "WBD", "WDAY", "XEL",
-    "ZS",
-]
+# La composition change chaque année en décembre : mettez-la à jour si besoin.
+NASDAQ100_SECOURS = {
+    "AAPL": "Apple",
+    "ABNB": "Airbnb",
+    "ADBE": "Adobe",
+    "ADI": "Analog Devices",
+    "ADP": "Automatic Data Processing",
+    "ADSK": "Autodesk",
+    "AEP": "American Electric Power",
+    "AMAT": "Applied Materials",
+    "AMD": "Advanced Micro Devices",
+    "AMGN": "Amgen",
+    "AMZN": "Amazon",
+    "APP": "AppLovin",
+    "ARM": "Arm Holdings",
+    "ASML": "ASML Holding",
+    "AVGO": "Broadcom",
+    "AXON": "Axon Enterprise",
+    "AZN": "AstraZeneca",
+    "BIIB": "Biogen",
+    "BKNG": "Booking Holdings",
+    "BKR": "Baker Hughes",
+    "CCEP": "Coca-Cola Europacific Partners",
+    "CDNS": "Cadence Design Systems",
+    "CDW": "CDW",
+    "CEG": "Constellation Energy",
+    "CHTR": "Charter Communications",
+    "CMCSA": "Comcast",
+    "COST": "Costco",
+    "CPRT": "Copart",
+    "CRWD": "CrowdStrike",
+    "CSCO": "Cisco",
+    "CSGP": "CoStar Group",
+    "CSX": "CSX",
+    "CTAS": "Cintas",
+    "CTSH": "Cognizant",
+    "DASH": "DoorDash",
+    "DDOG": "Datadog",
+    "DXCM": "DexCom",
+    "EA": "Electronic Arts",
+    "EXC": "Exelon",
+    "FANG": "Diamondback Energy",
+    "FAST": "Fastenal",
+    "FER": "Ferrovial",
+    "FTNT": "Fortinet",
+    "GEHC": "GE HealthCare",
+    "GFS": "GlobalFoundries",
+    "GILD": "Gilead Sciences",
+    "GOOG": "Alphabet (classe C)",
+    "GOOGL": "Alphabet (classe A)",
+    "HON": "Honeywell",
+    "IDXX": "IDEXX Laboratories",
+    "INTC": "Intel",
+    "INTU": "Intuit",
+    "ISRG": "Intuitive Surgical",
+    "KDP": "Keurig Dr Pepper",
+    "KHC": "Kraft Heinz",
+    "KLAC": "KLA",
+    "LIN": "Linde",
+    "LRCX": "Lam Research",
+    "LULU": "Lululemon",
+    "MAR": "Marriott",
+    "MCHP": "Microchip Technology",
+    "MDB": "MongoDB",
+    "MDLZ": "Mondelez",
+    "MELI": "MercadoLibre",
+    "META": "Meta Platforms",
+    "MNST": "Monster Beverage",
+    "MRVL": "Marvell Technology",
+    "MSFT": "Microsoft",
+    "MSTR": "Strategy (MicroStrategy)",
+    "MU": "Micron Technology",
+    "NFLX": "Netflix",
+    "NVDA": "Nvidia",
+    "NXPI": "NXP Semiconductors",
+    "ODFL": "Old Dominion Freight Line",
+    "ON": "ON Semiconductor",
+    "ORLY": "O'Reilly Automotive",
+    "PANW": "Palo Alto Networks",
+    "PAYX": "Paychex",
+    "PCAR": "Paccar",
+    "PDD": "PDD Holdings",
+    "PEP": "PepsiCo",
+    "PLTR": "Palantir",
+    "PYPL": "PayPal",
+    "QCOM": "Qualcomm",
+    "REGN": "Regeneron",
+    "ROP": "Roper Technologies",
+    "ROST": "Ross Stores",
+    "SBUX": "Starbucks",
+    "SHOP": "Shopify",
+    "SNPS": "Synopsys",
+    "TEAM": "Atlassian",
+    "TMUS": "T-Mobile US",
+    "TRI": "Thomson Reuters",
+    "TSLA": "Tesla",
+    "TTD": "The Trade Desk",
+    "TTWO": "Take-Two Interactive",
+    "TXN": "Texas Instruments",
+    "VRSK": "Verisk",
+    "VRTX": "Vertex Pharmaceuticals",
+    "WBD": "Warner Bros. Discovery",
+    "WDAY": "Workday",
+    "XEL": "Xcel Energy",
+    "ZS": "Zscaler",
+}
 
 
-def tableau_wikipedia(url, colonne_ticker, colonne_nom):
+def tableau_wikipedia(url, colonnes_ticker, colonnes_nom):
     """Lit le tableau des composants d'un indice sur Wikipédia.
 
+    `colonnes_ticker` / `colonnes_nom` : noms de colonnes possibles (Wikipédia les change parfois).
     Renvoie un dictionnaire {ticker: nom}.
     """
     reponse = requests.get(url, headers=ENTETES_HTTP, timeout=20)
@@ -111,26 +205,38 @@ def tableau_wikipedia(url, colonne_ticker, colonne_nom):
     # pandas sait lire tous les tableaux HTML d'une page
     tableaux = pd.read_html(StringIO(reponse.text))
     for tableau in tableaux:
-        if colonne_ticker in tableau.columns and colonne_nom in tableau.columns:
-            resultat = {}
-            for _, ligne in tableau.iterrows():
-                # Yahoo Finance écrit "BRK-B" et non "BRK.B"
-                ticker = str(ligne[colonne_ticker]).strip().replace(".", "-")
-                resultat[ticker] = str(ligne[colonne_nom]).strip()
-            if len(resultat) > 50:  # on vérifie que c'est bien le bon tableau
-                return resultat
+        # Certains tableaux ont des en-têtes sur 2 lignes : on garde la dernière
+        if isinstance(tableau.columns, pd.MultiIndex):
+            tableau.columns = tableau.columns.get_level_values(-1)
+        col_ticker = next((c for c in colonnes_ticker if c in tableau.columns), None)
+        col_nom = next((c for c in colonnes_nom if c in tableau.columns), None)
+        if col_ticker is None or col_nom is None or len(tableau) < 50:
+            continue  # ce n'est pas le bon tableau
+        resultat = {}
+        for _, ligne in tableau.iterrows():
+            # Yahoo Finance écrit "BRK-B" et non "BRK.B"
+            ticker = str(ligne[col_ticker]).strip().replace(".", "-")
+            resultat[ticker] = str(ligne[col_nom]).strip()
+        return resultat
     raise ValueError("Tableau des composants introuvable")
+
+
+COLONNES_TICKER = ["Ticker", "Symbol", "Ticker symbol"]
+COLONNES_NOM = ["Company", "Security", "Name", "Company name"]
 
 
 @st.cache_data(ttl=CACHE_24H, show_spinner=False)
 def liste_nasdaq100():
     """Composants du Nasdaq 100 (Wikipédia, sinon liste de secours)."""
     try:
-        return tableau_wikipedia(
-            "https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker", "Company"
+        resultat = tableau_wikipedia(
+            "https://en.wikipedia.org/wiki/Nasdaq-100", COLONNES_TICKER, COLONNES_NOM
         )
+        if 90 <= len(resultat) <= 110:  # vérification : environ 100 sociétés
+            return resultat
     except Exception:
-        return {t: t for t in NASDAQ100_SECOURS}
+        pass
+    return dict(NASDAQ100_SECOURS)
 
 
 @st.cache_data(ttl=CACHE_24H, show_spinner=False)
@@ -139,8 +245,8 @@ def liste_sp500():
     try:
         return tableau_wikipedia(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            "Symbol",
-            "Security",
+            COLONNES_TICKER,
+            COLONNES_NOM,
         )
     except Exception:
         url_csv = (
