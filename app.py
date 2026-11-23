@@ -8,6 +8,7 @@ Application Streamlit : Scanner 200 WMA + Portefeuille avec objectifs Fibonacci.
 Lancer en local :  streamlit run app.py
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 import pandas as pd
@@ -297,6 +298,248 @@ def objectif_vente(a, b, c):
 
 
 # ---------------------------------------------------------------------------
+# Score qualité (analyse fondamentale)
+# ---------------------------------------------------------------------------
+# 5 critères, 1 point chacun :
+#   1. Croissance du chiffre d'affaires   2. Rentabilité (ROE et marge)
+#   3. Free cash flow positif             4. Endettement raisonnable
+#   5. PER inférieur ou égal à la médiane de son secteur
+# Un critère sans données (ou non applicable, ex. la dette pour une banque)
+# n'est pas compté : le score s'affiche alors sur 4 ou sur 3.
+
+# Seuils des critères (modifiables)
+CROISSANCE_CA_MIN = 0.05  # croissance annuelle moyenne du CA : 5 %
+ROE_MIN = 0.12  # rentabilité des capitaux propres : 12 %
+DETTE_EBITDA_MAX = 2.5  # dette nette / EBITDA
+SECTEURS_FINANCIERS = {"Financial Services"}  # banques, assurances : dette et FCF non pertinents
+
+# Champs de Yahoo Finance que l'on garde
+CHAMPS_INFO = [
+    "sector", "trailingPE", "trailingEps", "returnOnEquity",
+    "totalDebt", "totalCash", "ebitda",
+]
+
+
+def _info_ticker(ticker):
+    """Infos générales d'une action (secteur, PER, ROE, dette…). {} en cas d'erreur."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+        return {champ: info.get(champ) for champ in CHAMPS_INFO}
+    except Exception:
+        return {}
+
+
+def _ligne_comptable(tableau, noms):
+    """Extrait une ligne d'un état financier, des années les plus anciennes aux plus récentes."""
+    if tableau is None or tableau.empty:
+        return []
+    for nom in noms:
+        if nom in tableau.index:
+            ligne = pd.to_numeric(tableau.loc[nom], errors="coerce").dropna().sort_index()
+            return [float(v) for v in ligne.values]
+    return []
+
+
+def _etats_ticker(ticker):
+    """Chiffre d'affaires, résultat opérationnel et free cash flow annuels (~4 ans)."""
+    try:
+        action = yf.Ticker(ticker)
+        compte = action.income_stmt
+        flux = action.cashflow
+        return {
+            "ca": _ligne_comptable(compte, ["Total Revenue", "Operating Revenue"]),
+            "resultat_op": _ligne_comptable(compte, ["Operating Income"]),
+            "fcf": _ligne_comptable(flux, ["Free Cash Flow"]),
+        }
+    except Exception:
+        return {"ca": [], "resultat_op": [], "fcf": []}
+
+
+def _en_parallele(fonction, tickers):
+    """Appelle `fonction` pour chaque ticker, 8 à la fois (beaucoup plus rapide)."""
+    with ThreadPoolExecutor(max_workers=8) as executeur:
+        return dict(zip(tickers, executeur.map(fonction, tickers)))
+
+
+@st.cache_data(ttl=CACHE_24H, show_spinner=False)
+def infos_indice(tickers):
+    """Infos générales de toutes les actions de l'indice (pour la médiane des PER par secteur)."""
+    return _en_parallele(_info_ticker, list(tickers))
+
+
+@st.cache_data(ttl=CACHE_24H, show_spinner=False)
+def etats_financiers(tickers):
+    """États financiers des actions demandées (seulement les candidats, car c'est lent)."""
+    return _en_parallele(_etats_ticker, list(tickers))
+
+
+def medianes_per(infos):
+    """PER médian de chaque secteur (au moins 3 entreprises bénéficiaires)."""
+    lignes = [
+        {"secteur": i.get("sector"), "per": i.get("trailingPE")}
+        for i in infos.values()
+        if i.get("sector") and isinstance(i.get("trailingPE"), (int, float))
+        and 0 < i["trailingPE"] < 300  # on écarte les valeurs aberrantes
+    ]
+    if not lignes:
+        return {}
+    df = pd.DataFrame(lignes)
+    comptes = df.groupby("secteur")["per"].count()
+    medianes = df.groupby("secteur")["per"].median()
+    return {s: m for s, m in medianes.items() if comptes[s] >= 3}
+
+
+def score_qualite(info, etats, mediane_secteur):
+    """Évalue les 5 critères. Renvoie (points, nb_criteres_evalues, liste_des_criteres).
+
+    Chaque critère est un dict : nom, ok (True / False / None si non évaluable), détail.
+    """
+    criteres = []
+    financier = info.get("sector") in SECTEURS_FINANCIERS
+
+    # 1. Croissance du chiffre d'affaires
+    ca = etats.get("ca", [])[-4:]
+    if len(ca) >= 2 and ca[0] > 0:
+        annees = len(ca) - 1
+        croissance_moy = (ca[-1] / ca[0]) ** (1 / annees) - 1
+        derniere = ca[-1] / ca[-2] - 1
+        criteres.append({
+            "nom": "Croissance du chiffre d'affaires",
+            "ok": croissance_moy > CROISSANCE_CA_MIN and derniere >= 0,
+            "detail": f"{croissance_moy:+.1%} par an sur {annees} an(s), dernière année {derniere:+.1%} "
+                      f"(il faut > {CROISSANCE_CA_MIN:.0%} par an et pas de recul)",
+        })
+    else:
+        criteres.append({"nom": "Croissance du chiffre d'affaires", "ok": None, "detail": "Données absentes"})
+
+    # 2. Rentabilité : ROE suffisant et marge opérationnelle qui ne se dégrade pas
+    roe = info.get("returnOnEquity")
+    res_op = etats.get("resultat_op", [])
+    tout_ca = etats.get("ca", [])
+    marges = [r / c for r, c in zip(res_op[-2:], tout_ca[-2:]) if c] if len(res_op) >= 2 and len(tout_ca) >= 2 else []
+    if isinstance(roe, (int, float)):
+        ok = roe >= ROE_MIN
+        detail = f"ROE {roe:.1%} (il faut ≥ {ROE_MIN:.0%})"
+        if len(marges) == 2:
+            ok = ok and marges[1] >= marges[0] - 0.01  # tolérance d'un point
+            detail += f", marge opérationnelle {marges[0]:.1%} → {marges[1]:.1%} (ne doit pas baisser)"
+        criteres.append({"nom": "Rentabilité", "ok": ok, "detail": detail})
+    else:
+        criteres.append({"nom": "Rentabilité", "ok": None, "detail": "Données absentes"})
+
+    # 3. Free cash flow positif sur les 2 dernières années
+    fcf = etats.get("fcf", [])[-2:]
+    if financier:
+        criteres.append({"nom": "Free cash flow", "ok": None, "detail": "Non applicable (secteur financier)"})
+    elif fcf:
+        texte = ", ".join(f"{v / 1e9:+.2f} Md" for v in fcf)
+        criteres.append({"nom": "Free cash flow", "ok": all(v > 0 for v in fcf),
+                         "detail": f"{texte} (doit être positif)"})
+    else:
+        criteres.append({"nom": "Free cash flow", "ok": None, "detail": "Données absentes"})
+
+    # 4. Endettement : dette nette / EBITDA
+    dette, tresorerie, ebitda = info.get("totalDebt"), info.get("totalCash"), info.get("ebitda")
+    if financier:
+        criteres.append({"nom": "Endettement", "ok": None, "detail": "Non applicable (secteur financier)"})
+    elif isinstance(dette, (int, float)):
+        dette_nette = dette - (tresorerie or 0)
+        if dette_nette <= 0:
+            criteres.append({"nom": "Endettement", "ok": True, "detail": "Plus de trésorerie que de dettes"})
+        elif isinstance(ebitda, (int, float)) and ebitda > 0:
+            ratio = dette_nette / ebitda
+            criteres.append({"nom": "Endettement", "ok": ratio < DETTE_EBITDA_MAX,
+                             "detail": f"Dette nette / EBITDA = {ratio:.1f} (il faut < {DETTE_EBITDA_MAX})"})
+        else:
+            criteres.append({"nom": "Endettement", "ok": False, "detail": "Endettée avec un EBITDA négatif"})
+    else:
+        criteres.append({"nom": "Endettement", "ok": None, "detail": "Données absentes"})
+
+    # 5. PER par rapport à la médiane du secteur
+    per, bpa = info.get("trailingPE"), info.get("trailingEps")
+    if isinstance(bpa, (int, float)) and bpa <= 0:
+        criteres.append({"nom": "PER vs secteur", "ok": False, "detail": "L'entreprise perd de l'argent"})
+    elif isinstance(per, (int, float)) and per > 0 and mediane_secteur:
+        criteres.append({"nom": "PER vs secteur", "ok": per <= mediane_secteur,
+                         "detail": f"PER {per:.1f} contre {mediane_secteur:.1f} pour le secteur "
+                                   f"{info.get('sector')} (doit être ≤)"})
+    else:
+        criteres.append({"nom": "PER vs secteur", "ok": None, "detail": "Données absentes"})
+
+    evalues = [c for c in criteres if c["ok"] is not None]
+    points = sum(1 for c in evalues if c["ok"])
+    return points, len(evalues), criteres
+
+
+def verdict(points, evalues):
+    """Transforme le score en verdict lisible."""
+    if evalues < 3:
+        return "⚪ Données insuffisantes"
+    ratio = points / evalues
+    if ratio >= 0.8:
+        return "🟢 ACHAT"
+    if ratio >= 0.4:
+        return "🟡 À surveiller"
+    return "🔴 Piège possible"
+
+
+def section_qualite(nom_indice, composants, tableau):
+    """Affiche le score qualité des actions ayant un signal ACHAT technique."""
+    st.subheader("🏅 Score qualité")
+    st.caption(
+        "Vérifie la santé de l'entreprise pour éviter les « pièges » : "
+        "croissance du CA, rentabilité, free cash flow, dette, PER vs secteur."
+    )
+    candidats = tableau[tableau["Signal"] != ""]
+    if candidats.empty:
+        st.info("Aucun signal ACHAT technique à analyser.")
+        return
+    if not st.toggle(f"Calculer le score qualité des {len(candidats)} signaux ACHAT", key=f"qualite_{nom_indice}"):
+        st.caption("Le premier calcul peut prendre 1 à 3 minutes (puis il est gardé 24 h).")
+        return
+
+    with st.spinner("Téléchargement des données financières…"):
+        infos = infos_indice(tuple(sorted(composants)))
+        etats = etats_financiers(tuple(sorted(candidats["Ticker"])))
+    medianes = medianes_per(infos)
+
+    lignes, fiches = [], {}
+    for _, ligne in candidats.iterrows():
+        t = ligne["Ticker"]
+        info = infos.get(t, {})
+        points, evalues, criteres = score_qualite(info, etats.get(t, {}), medianes.get(info.get("sector")))
+        fiches[t] = (ligne["Nom"], points, evalues, criteres)
+        lignes.append({
+            "Ticker": t,
+            "Nom": ligne["Nom"],
+            "Écart %": ligne["Écart %"],
+            "Qualité": f"{points}/{evalues}",
+            "Verdict": verdict(points, evalues),
+            "_tri": points / evalues if evalues >= 3 else -1,  # données insuffisantes en bas
+        })
+
+    resultat = pd.DataFrame(lignes).sort_values(["_tri", "Écart %"], ascending=[False, True])
+    st.dataframe(
+        resultat.drop(columns="_tri"),
+        hide_index=True,
+        width="stretch",
+        column_config={"Écart %": st.column_config.NumberColumn(format="%+.1f %%")},
+    )
+    st.caption("🟢 ≥ 80 % des critères · 🟡 40 à 79 % · 🔴 < 40 % · ⚪ moins de 3 critères évaluables")
+
+    # Fiche détaillée : explique chaque critère
+    choix = st.selectbox(
+        "Fiche détaillée", resultat["Ticker"],
+        format_func=lambda t: f"{t} — {fiches[t][0]}",
+    )
+    nom, points, evalues, criteres = fiches[choix]
+    st.markdown(f"**{nom}** : {points}/{evalues} → {verdict(points, evalues)}")
+    for c in criteres:
+        icone = {True: "✅", False: "❌", None: "➖"}[c["ok"]]
+        st.markdown(f"{icone} **{c['nom']}** — {c['detail']}")
+
+
+# ---------------------------------------------------------------------------
 # Écran 1 : Scanner
 # ---------------------------------------------------------------------------
 
@@ -305,7 +548,8 @@ def ecran_scanner():
     st.header("🔎 Scanner 200 WMA")
     st.caption(
         "Moyenne mobile simple sur 200 semaines. "
-        "Signal **ACHAT** si le cours est ≤ 200 WMA × 1,05."
+        "Signal **ACHAT** si le cours est ≤ 200 WMA × 1,05, "
+        "puis un score qualité vérifie la santé de l'entreprise."
     )
 
     nom_indice = st.radio(
@@ -357,6 +601,7 @@ def ecran_scanner():
     col2.metric("Signaux ACHAT", int(nb_achats))
     col3.metric("Ignorées (< 200 sem.)", ignorees)
 
+    tableau_complet = tableau
     if st.toggle("Afficher seulement les signaux ACHAT"):
         tableau = tableau[tableau["Signal"] != ""]
 
@@ -371,6 +616,9 @@ def ecran_scanner():
         },
     )
     st.caption(f"Dernière semaine de données : {cours.index[-1]:%d/%m/%Y}. Données mises en cache 24 h.")
+
+    # Score qualité calculé sur le tableau complet (pas seulement le filtre affiché)
+    section_qualite(nom_indice, composants, tableau_complet)
 
 
 # ---------------------------------------------------------------------------
