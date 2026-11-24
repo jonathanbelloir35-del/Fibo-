@@ -945,13 +945,18 @@ def main():
 #   - le RSI hebdomadaire est inférieur à 40 (l'action a beaucoup baissé récemment)
 #   - ET la note fondamentale est supérieure ou égale à 7 (l'entreprise est solide)
 
-RSI_ALERTE = 40
+RSI_ALERTE = 40  # valeur proposée par défaut ; réglable avec le curseur de la page
 NOTE_FOND_ALERTE = 7
 
 
 def page_alerte_achat():
     st.title("🚨 Alerte achat")
-    st.caption(f"Actions avec un **RSI hebdomadaire < {RSI_ALERTE}** et une "
+    # Curseur : seuil de RSI en dessous duquel une action déclenche une alerte achat
+    seuil_rsi = st.slider("Alerte si RSI hebdomadaire inférieur à", 15, 60, RSI_ALERTE, key="alerte_rsi",
+                          help="Plus le seuil est bas, plus l'action doit avoir baissé fortement "
+                               "(30 = survente classique). Plus il est haut, plus il y a d'alertes, "
+                               "et plus le calcul est long (comptes de chaque action à télécharger).")
+    st.caption(f"Actions avec un **RSI hebdomadaire < {seuil_rsi}** et une "
                f"**note fondamentale ≥ {NOTE_FOND_ALERTE}/10**.")
 
     indices = st.multiselect("Indices surveillés", ["CAC 40", "Nasdaq 100", "S&P 500"],
@@ -974,7 +979,7 @@ def page_alerte_achat():
             if tableau.empty:
                 continue
             financieres_toutes |= financieres
-            for _, ligne in tableau[tableau["RSI"] < RSI_ALERTE].iterrows():
+            for _, ligne in tableau[tableau["RSI"] < seuil_rsi].iterrows():
                 if ligne["Ticker"] in series:  # action présente dans 2 indices (ex. Nasdaq 100 et S&P 500)
                     continue
                 series[ligne["Ticker"]] = cours[ligne["Ticker"]].dropna()
@@ -982,11 +987,11 @@ def page_alerte_achat():
                 candidats.append({**ligne.to_dict(), "Indice": nom_indice})
 
     if not candidats:
-        st.success(f"Aucune action n'a un RSI hebdomadaire inférieur à {RSI_ALERTE} en ce moment.")
+        st.success(f"Aucune action n'a un RSI hebdomadaire inférieur à {seuil_rsi} en ce moment.")
         return
 
     # --- 2. Note fondamentale de ces actions seulement (plus lent) ---
-    st.caption(f"{len(candidats)} action(s) avec un RSI < {RSI_ALERTE} : calcul de leur note fondamentale…")
+    st.caption(f"{len(candidats)} action(s) avec un RSI < {seuil_rsi} : calcul de leur note fondamentale…")
     comptes, erreurs = comptes_annuels([c["Ticker"] for c in candidats])
     alertes = []
     for c in candidats:
@@ -1006,12 +1011,12 @@ def page_alerte_achat():
             st.rerun()
 
     c1, c2 = st.columns(2)
-    c1.metric(f"RSI < {RSI_ALERTE}", len(candidats))
+    c1.metric(f"RSI < {seuil_rsi}", len(candidats))
     c2.metric("🚨 Alertes achat", len(alertes))
 
     if not alertes:
         st.info(f"Aucune action ne remplit les deux conditions pour le moment "
-                f"(note fondamentale ≥ {NOTE_FOND_ALERTE} et RSI < {RSI_ALERTE}).")
+                f"(note fondamentale ≥ {NOTE_FOND_ALERTE} et RSI < {seuil_rsi}).")
         return
 
     # Tableau trié du RSI le plus bas (le plus survendu) au plus haut
