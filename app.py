@@ -1214,7 +1214,7 @@ def page_test_historique():
         c1, c2 = st.columns(2)
         capital = c1.number_input("Capital de départ (€)", 1000, 1_000_000, 10_000, 1000, key="bt_capital")
         mise = c2.number_input("Achat maximum par ligne (€)", 100, 100_000, 1_000, 100, key="bt_mise")
-        debut = pd.Timestamp(st.date_input("Date de départ", pd.Timestamp("2020-01-01"), key="bt_debut",
+        debut = pd.Timestamp(st.date_input("Date de départ", pd.Timestamp("2023-01-01"), key="bt_debut",
                                            format="DD/MM/YYYY"))
         seuil_achat = st.slider("Achat si RSI hebdo inférieur à", 15, 50, 30, key="bt_achat")
         seuil_vente = st.slider("Vente si RSI hebdo supérieur à", 50, 90, 70, key="bt_vente")
