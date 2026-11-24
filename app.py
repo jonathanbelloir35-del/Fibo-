@@ -19,6 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -1065,13 +1066,13 @@ def page_alerte_achat():
 #   - Une seule position à la fois par action.
 #
 # Filtre fondamental (au choix) :
-#   - « Aucune note »      : on achète sur le RSI seul.
+#   - « Aucune note »      : aucun filtre sur la santé financière.
 #   - « Note de l'époque » : seulement les comptes publiés AVANT l'achat (honnête, mais Yahoo ne
 #                            donne qu'environ 4 ans de comptes : peu d'achats avant ~2023).
 #   - « Note d'aujourd'hui » : note actuelle appliquée au passé (résultat trop optimiste).
 
 DELAI_PUBLICATION = pd.Timedelta(days=90)  # les comptes annuels sont publiés ~3 mois après la clôture
-MODE_SANS_NOTE = "Aucune note (RSI seul)"
+MODE_SANS_NOTE = "Aucune note (pas de filtre)"
 MODE_EPOQUE = "Note de l'époque (honnête, peu d'achats avant 2023)"
 MODE_AUJOURDHUI = "Note d'aujourd'hui (trop optimiste)"
 INDICES_YAHOO = {"CAC 40": "^FCHI", "Nasdaq 100": "^NDX", "S&P 500": "^GSPC"}  # pour la comparaison
@@ -1151,7 +1152,8 @@ def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_ach
                 montant_vente = pos["parts"] * tableau_prix[i, j]
                 liquidites += montant_vente
                 transactions.append({**pos, "date_vente": date, "prix_vente": tableau_prix[i, j],
-                                     "montant_vente": montant_vente, "statut": "Vendue"})
+                                     "montant_vente": montant_vente, "statut": "Vendue",
+                                     "raison": f"RSI > {seuil_vente}"})
         # 2. Achats : les plus survendues d'abord, tant qu'il reste de l'argent
         candidats = [(tableau_rsi[i, j], j) for j in range(len(tickers))
                      if j not in positions and tableau_rsi[i, j] < seuil_achat and tableau_prix[i, j] > 0]
@@ -1172,7 +1174,132 @@ def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_ach
     for j, pos in positions.items():  # positions encore ouvertes, valorisées au dernier cours
         montant_vente = pos["parts"] * tableau_prix[-1, j]
         transactions.append({**pos, "date_vente": dates[-1], "prix_vente": tableau_prix[-1, j],
-                             "montant_vente": montant_vente, "statut": "En cours"})
+                             "montant_vente": montant_vente, "statut": "En cours", "raison": "—"})
+    return transactions, pd.DataFrame(evolution).set_index("date")
+
+
+# -----------------------------------------------------------------------------
+# Stratégie « Zone Fibonacci + invalidation + objectif » (méthode Elliott / Fibonacci)
+# -----------------------------------------------------------------------------
+# - Dernière hausse = creux A → sommet B, repérés par le ZigZag avec les SEULS cours connus à chaque date.
+# - ACHAT  quand le cours revient dans la zone de retracement (ex. 50 % à 78,6 % de la hausse),
+#          et (option) qu'il reste au-dessus de la moyenne 200 semaines.
+# - VENTE  à l'objectif : A + extension × (B − A)   (ex. 1,618)
+#          ou si le scénario est invalidé : clôture sous le niveau d'invalidation (ex. sous le creux A).
+
+STRAT_RSI = "RSI (survente / surachat)"
+STRAT_FIBO = "Zone Fibonacci + invalidation + objectif"
+
+
+def jambes_en_ligne(valeurs, seuil):
+    """Pour chaque semaine, la dernière hausse (creux A, sommet B) connue À CETTE DATE (sans regarder le futur).
+
+    Pendant une hausse, le sommet B est provisoire (le plus haut atteint) ; pendant une baisse,
+    on garde la dernière hausse terminée. Renvoie deux tableaux A et B (NaN si inconnue)."""
+    n = len(valeurs)
+    A, B = np.full(n, np.nan), np.full(n, np.nan)
+    tendance, i_haut, i_bas, i_ext = None, 0, 0, 0
+    dernier_creux, hausse_terminee = None, None
+    for i in range(1, n):
+        v = valeurs[i]
+        if tendance is None:  # démarrage : on attend un premier mouvement suffisant
+            i_haut = i if v > valeurs[i_haut] else i_haut
+            i_bas = i if v < valeurs[i_bas] else i_bas
+            if v >= valeurs[i_bas] * (1 + seuil):
+                dernier_creux, tendance, i_ext = valeurs[i_bas], "hausse", i
+            elif v <= valeurs[i_haut] * (1 - seuil):
+                tendance, i_ext = "baisse", i
+        elif tendance == "hausse":
+            if v > valeurs[i_ext]:
+                i_ext = i
+            elif v <= valeurs[i_ext] * (1 - seuil):  # le sommet est confirmé : la hausse est terminée
+                hausse_terminee = (dernier_creux, valeurs[i_ext]) if dernier_creux is not None else None
+                tendance, i_ext = "baisse", i
+        else:
+            if v < valeurs[i_ext]:
+                i_ext = i
+            elif v >= valeurs[i_ext] * (1 + seuil):  # le creux est confirmé
+                dernier_creux, tendance, i_ext = valeurs[i_ext], "hausse", i
+        if tendance == "hausse" and dernier_creux is not None:
+            A[i], B[i] = dernier_creux, valeurs[i_ext]
+        elif tendance == "baisse" and hausse_terminee:
+            A[i], B[i] = hausse_terminee
+    return A, B
+
+
+def simuler_portefeuille_fibo(cours, tickers, filtre, debut, capital, mise, zone_haut, zone_bas,
+                              invalidation, extension, filtre_200, indice=None, seuil_zigzag=SEUIL_ZIGZAG):
+    """Simulation semaine par semaine de la stratégie Fibonacci. Même format de sortie que simuler_portefeuille.
+
+    zone_haut / zone_bas : retracements délimitant la zone d'achat (ex. 0,5 et 0,786)
+    invalidation         : retracement sous lequel on vend (1,0 = sous le creux A)
+    extension            : objectif de vente = A + extension × (B − A) (ex. 1,618)"""
+    prix = cours[tickers].ffill()
+    dates = prix.index[prix.index >= debut]
+    # Dernière hausse connue à chaque date, pour chaque action
+    tableau_a = pd.DataFrame(index=prix.index, columns=tickers, dtype=float)
+    tableau_b = tableau_a.copy()
+    for t in tickers:
+        serie = cours[t].dropna()
+        if len(serie) > 30:
+            a, b = jambes_en_ligne(serie.values, seuil_zigzag)
+            tableau_a.loc[serie.index, t], tableau_b.loc[serie.index, t] = a, b
+    A = tableau_a.ffill(limit=2).loc[dates].to_numpy()
+    B = tableau_b.ffill(limit=2).loc[dates].to_numpy()
+    P = prix.loc[dates].to_numpy()
+    W = prix.rolling(PERIODE_WMA).mean().loc[dates].to_numpy()  # moyenne 200 semaines
+    R = pd.DataFrame({t: rsi_fiable(cours[t].dropna()) for t in tickers}).reindex(prix.index).loc[dates].to_numpy()
+
+    cours_indice = indice.reindex(dates).ffill().to_numpy() if indice is not None else None
+    liquidites, positions, transactions, evolution = capital, {}, [], []
+    for i, date in enumerate(dates):
+        if cours_indice is not None and i > 0 and cours_indice[i - 1] > 0 and cours_indice[i] > 0:
+            liquidites *= cours_indice[i] / cours_indice[i - 1]  # l'argent en attente suit l'indice
+        # 1. Ventes : objectif atteint, ou scénario invalidé
+        for j in list(positions):
+            pos, px = positions[j], P[i, j]
+            if np.isnan(px):
+                continue
+            raison = None
+            if px < pos["stop"]:
+                raison = "Invalidation"
+            elif px >= pos["objectif"]:
+                raison = "Objectif atteint"
+            if raison:
+                positions.pop(j)
+                montant_vente = pos["parts"] * px
+                liquidites += montant_vente
+                transactions.append({**pos, "date_vente": date, "prix_vente": px,
+                                     "montant_vente": montant_vente, "statut": "Vendue", "raison": raison})
+        # 2. Achats : actions revenues dans la zone (les plus survendues d'abord)
+        candidats = []
+        for j in range(len(tickers)):
+            if j in positions or np.isnan(P[i, j]) or np.isnan(A[i, j]) or not B[i, j] > A[i, j]:
+                continue
+            repli = (B[i, j] - P[i, j]) / (B[i, j] - A[i, j])  # 0 = au sommet B, 1 = revenu au creux A
+            if not zone_haut <= repli <= zone_bas:
+                continue
+            if filtre_200 and not P[i, j] > W[i, j]:
+                continue
+            candidats.append((R[i, j] if not np.isnan(R[i, j]) else 50, j, repli))
+        for r, j, repli in sorted(candidats):
+            if liquidites < ACHAT_MINIMUM:
+                break
+            if not filtre.autorise(tickers[j], date):
+                continue
+            montant = min(mise, liquidites)
+            liquidites -= montant
+            a, b = A[i, j], B[i, j]
+            positions[j] = {"Ticker": tickers[j], "date": date, "prix": P[i, j], "rsi": r, "repli": repli * 100,
+                            "parts": montant / P[i, j], "montant": montant, "note": filtre.note(tickers[j], date),
+                            "stop": b - invalidation * (b - a), "objectif": a + extension * (b - a)}
+        investi = sum(p["parts"] * (P[i, j] if not np.isnan(P[i, j]) else p["prix"]) for j, p in positions.items())
+        evolution.append({"date": date, "Portefeuille": liquidites + investi, "Liquidités": liquidites})
+
+    for j, pos in positions.items():
+        montant_vente = pos["parts"] * P[-1, j]
+        transactions.append({**pos, "date_vente": dates[-1], "prix_vente": P[-1, j],
+                             "montant_vente": montant_vente, "statut": "En cours", "raison": "—"})
     return transactions, pd.DataFrame(evolution).set_index("date")
 
 
@@ -1209,7 +1336,8 @@ def graphique_evolution(evolution, capital, indice, nom_indice, reference=None, 
 
 
 def graphique_transactions(ticker, serie, transactions, seuil_achat, seuil_vente, debut):
-    """Cours avec les achats (▲ vert) et les ventes (▼ rouge), puis le RSI avec les deux seuils."""
+    """Cours avec les achats (▲ vert) et les ventes (▼ rouge). Stratégie RSI : graphique du RSI en dessous.
+    Stratégie Fibonacci (seuil_achat = None) : objectif et invalidation de chaque achat en pointillés."""
     serie = serie.loc[debut - pd.Timedelta(weeks=26):]
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=serie.index, y=serie.values, name="Cours", line=dict(color="#1f77b4")))
@@ -1220,9 +1348,17 @@ def graphique_transactions(ticker, serie, transactions, seuil_achat, seuil_vente
     fig.add_trace(go.Scatter(x=[t["date_vente"] for t in ventes], y=[t["prix_vente"] for t in ventes],
                              mode="markers", name="Vente",
                              marker=dict(symbol="triangle-down", size=13, color="red")))
+    for k, t in enumerate(transactions):  # stratégie Fibonacci : objectif et invalidation de chaque achat
+        if "objectif" in t and "stop" in t:
+            for niveau, couleur, nom in [(t["objectif"], "green", "Objectif"), (t["stop"], "red", "Invalidation")]:
+                fig.add_trace(go.Scatter(x=[t["date"], t["date_vente"]], y=[niveau, niveau], mode="lines",
+                                         name=nom, legendgroup=nom, showlegend=(k == 0),
+                                         line=dict(color=couleur, width=1, dash="dot")))
     fig.update_layout(title=f"{ticker} — achats et ventes", height=380, hovermode="x unified",
                       margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.15))
     st.plotly_chart(fig, width="stretch", config=SANS_OUTILS)
+    if seuil_achat is None:
+        return
 
     r = rsi(serie)
     fig_rsi = go.Figure(go.Scatter(x=r.index, y=r.values, name="RSI", line=dict(color="#9467bd")))
@@ -1239,11 +1375,15 @@ def euros(x):
 
 def page_test_historique():
     st.title("🧪 Test historique")
-    st.caption("Simulation d'un portefeuille : achat en survente (RSI bas), revente en surachat (RSI haut).")
+    st.caption("Simulation d'un portefeuille, semaine après semaine, selon la stratégie choisie.")
 
     nom_indice = st.radio("Indice", ["CAC 40", "Nasdaq 100", "S&P 500"], horizontal=True, key="bt_indice")
+    strategie = st.radio("Stratégie", [STRAT_RSI, STRAT_FIBO], key="bt_strategie",
+                         help="RSI : achat en survente, vente en surachat. Fibonacci : achat quand le cours revient "
+                              "dans la zone de retracement de la dernière hausse, vente à l'objectif d'extension "
+                              "ou si le scénario est invalidé.")
     mode = st.radio("Filtre fondamental", [MODE_SANS_NOTE, MODE_EPOQUE, MODE_AUJOURDHUI], key="bt_mode",
-                    help="« Aucune note » : achat sur le RSI seul. « Époque » : seulement les comptes publiés "
+                    help="« Aucune note » : aucun filtre sur la santé financière. « Époque » : seulement les comptes publiés "
                          "avant l'achat. « Aujourd'hui » : note actuelle appliquée au passé (trop flatteur).")
     with st.expander("⚙️ Règles", expanded=False):
         c1, c2 = st.columns(2)
@@ -1253,16 +1393,43 @@ def page_test_historique():
                                            format="DD/MM/YYYY"))
         # Réglages par défaut issus de l'analyse sur 4 périodes × 3 indices (2011-2026) :
         # acheter un peu plus tôt (35) et revendre plus tard (80) a donné de meilleurs résultats que 30/70.
-        seuil_achat = st.slider("Achat si RSI hebdo inférieur à", 15, 50, 35, key="bt_achat")
-        seuil_vente = st.slider("Vente si RSI hebdo supérieur à", 50, 90, 80, key="bt_vente")
+        if strategie == STRAT_RSI:
+            seuil_achat = st.slider("Achat si RSI hebdo inférieur à", 15, 50, 35, key="bt_achat")
+            seuil_vente = st.slider("Vente si RSI hebdo supérieur à", 50, 90, 80, key="bt_vente")
+        else:
+            # Réglages par défaut issus de l'analyse (zone 0,5-0,786, invalidation sous A, objectif 1,618)
+            seuil_achat = seuil_vente = None
+            niveaux = [0.236, 0.382, 0.5, 0.618, 0.786]
+            zone_haut, zone_bas = st.select_slider(
+                "Zone d'achat (repli de la dernière hausse)", options=niveaux, value=(0.5, 0.786),
+                format_func=lambda x: f"{x * 100:.1f} %".replace(".0 %", " %"), key="bt_zone")
+            invalidation = st.select_slider(
+                "Invalidation (vente si le repli dépasse)", options=[0.786, 0.886, 1.0, 1.1], value=1.0,
+                format_func=lambda x: "sous le creux A (100 %)" if x == 1.0 else f"{x * 100:.1f} %", key="bt_inval")
+            extension = st.select_slider(
+                "Objectif de vente (extension de la hausse)", options=[1.0, 1.272, 1.618, 2.0, 2.618], value=1.618,
+                format_func=lambda x: "retour au sommet B (1,0)" if x == 1.0 else f"{x:g}".replace(".", ","),
+                key="bt_ext")
+            filtre_200 = st.toggle("Seulement si le cours est au-dessus de la moyenne 200 semaines", value=True,
+                                   key="bt_f200", help="Tendance de fond haussière. Moyenne disponible seulement "
+                                                       "après 200 semaines de cotation (≈ fin 2020 pour 10 ans de données).")
         attente_indice = st.toggle("Placer l'argent en attente dans l'indice (ETF)", value=True, key="bt_etf",
                                    help="Au lieu de dormir, l'argent qui attend un signal d'achat suit l'indice. "
                                         "C'est l'amélioration la plus fiable trouvée par l'analyse.")
         note_min = st.slider("Note fondamentale minimale (si filtre)", 0.0, 10.0, 7.0, 0.5, key="bt_note")
     regle_note = "" if mode == MODE_SANS_NOTE else f" et note fondamentale ≥ {note_min:g}/10"
     texte_attente = " L'argent en attente est placé dans l'indice." if attente_indice else ""
+    if strategie == STRAT_RSI:
+        texte_regles = f"Achat si RSI < {seuil_achat}{regle_note} ; vente si RSI > {seuil_vente}."
+    else:
+        def fr(x):  # 0.786 -> « 78,6 % »
+            return f"{x * 100:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " %"
+        texte_inval = "sous le creux A" if invalidation == 1.0 else f"au-delà de {fr(invalidation)} de repli"
+        texte_regles = (f"Achat si le cours revient entre {fr(zone_haut)} et {fr(zone_bas)} de repli de la dernière "
+                        f"hausse{' (au-dessus de la 200 WMA)' if filtre_200 else ''}{regle_note} ; vente à l'objectif "
+                        f"{f'{extension:g}'.replace('.', ',')} ou si le cours passe {texte_inval}.")
     st.caption(f"Départ le {debut:%d/%m/%Y} avec {euros(capital)}, {euros(mise)} maximum par achat. "
-               f"Achat si RSI < {seuil_achat}{regle_note} ; vente si RSI > {seuil_vente}.{texte_attente}")
+               f"{texte_regles}{texte_attente}")
 
     if not st.toggle("Lancer le test", key=f"bt_lancer_{nom_indice}"):
         return
@@ -1283,7 +1450,10 @@ def page_test_historique():
     # les actions qui ont été au moins une fois en survente depuis la date de départ)
     comptes = {}
     if mode != MODE_SANS_NOTE:
-        candidats = [t for t in tickers if (rsi_fiable(cours[t].dropna()).loc[debut:] < seuil_achat).any()]
+        if strategie == STRAT_RSI:
+            candidats = [t for t in tickers if (rsi_fiable(cours[t].dropna()).loc[debut:] < seuil_achat).any()]
+        else:
+            candidats = tickers  # toutes les actions peuvent entrer dans leur zone d'achat
         comptes, erreurs = comptes_annuels(candidats)
         if erreurs:
             st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : elles ne seront pas achetées. "
@@ -1299,9 +1469,15 @@ def page_test_historique():
         st.warning("Cours de l'indice indisponibles : l'argent en attente reste en liquidités.")
 
     filtre = FiltreFondamental(mode, cours, comptes, financieres, note_min)
-    transactions, evolution = simuler_portefeuille(cours, tickers, filtre, debut, capital, mise,
-                                                   seuil_achat, seuil_vente,
-                                                   indice=cours_indice if attente_indice else None)
+    if strategie == STRAT_RSI:
+        transactions, evolution = simuler_portefeuille(cours, tickers, filtre, debut, capital, mise,
+                                                       seuil_achat, seuil_vente,
+                                                       indice=cours_indice if attente_indice else None)
+    else:
+        with st.spinner("Simulation de la stratégie Fibonacci…"):
+            transactions, evolution = simuler_portefeuille_fibo(
+                cours, tickers, filtre, debut, capital, mise, zone_haut, zone_bas, invalidation, extension,
+                filtre_200, indice=cours_indice if attente_indice else None)
 
     # Comparaisons : même capital placé dans l'indice, et référence équipondérée
     indice = None
@@ -1355,7 +1531,8 @@ def page_test_historique():
                    "c'est-à-dire en sachant déjà qu'elles se portent bien.")
 
     if not transactions:
-        st.info("Aucun achat sur la période. Essayez un seuil d'achat plus haut (ex. 40).")
+        st.info("Aucun achat sur la période. Essayez des réglages moins stricts "
+                "(seuil d'achat plus haut, zone d'achat plus large ou sans filtre 200 WMA).")
         return
 
     df = pd.DataFrame(transactions)
@@ -1368,6 +1545,10 @@ def page_test_historique():
     c5.metric("Achats", len(df))
     c6.metric("Gagnants", f"{(df['Rendement %'] > 0).mean():.0%}")
     c7.metric("En cours", int((df["statut"] == "En cours").sum()))
+    if strategie == STRAT_FIBO:
+        c8, c9 = st.columns(2)
+        c8.metric("🎯 Objectifs atteints", int((df["raison"] == "Objectif atteint").sum()))
+        c9.metric("🛑 Invalidations", int((df["raison"] == "Invalidation").sum()))
 
     # --- Tableaux ---
     prix = st.column_config.NumberColumn(format="%.2f")
@@ -1376,9 +1557,11 @@ def page_test_historique():
     st.markdown("**Toutes les transactions**")
     detail = df.sort_values("date", ascending=False).rename(columns={
         "date": "Achat le", "prix": "Prix achat", "montant": "Investi", "date_vente": "Vente le",
-        "prix_vente": "Prix vente", "statut": "Statut", "note": "Note fond.", "rsi": "RSI achat"})
-    colonnes = ["Ticker", "Nom", "Achat le", "Investi", "Gain €", "Rendement %", "Vente le", "Statut",
-                "Durée (sem.)", "Prix achat", "Prix vente", "RSI achat"]
+        "prix_vente": "Prix vente", "statut": "Statut", "note": "Note fond.", "rsi": "RSI achat",
+        "raison": "Raison", "repli": "Repli à l'achat %", "objectif": "Objectif", "stop": "Invalidation"})
+    colonnes = ["Ticker", "Nom", "Achat le", "Investi", "Gain €", "Rendement %", "Vente le", "Statut", "Raison",
+                "Durée (sem.)", "Prix achat", "Prix vente"]
+    colonnes += ["RSI achat"] if strategie == STRAT_RSI else ["Repli à l'achat %", "Objectif", "Invalidation"]
     if mode != MODE_SANS_NOTE:
         colonnes.append("Note fond.")
     st.dataframe(detail[colonnes], hide_index=True, width="stretch", column_config={
@@ -1390,6 +1573,8 @@ def page_test_historique():
         "Prix achat": prix, "Prix vente": prix, "Rendement %": pct,
         "Note fond.": st.column_config.NumberColumn(format="%.1f"),
         "RSI achat": st.column_config.NumberColumn(format="%.0f"),
+        "Repli à l'achat %": st.column_config.NumberColumn(format="%.0f %%"),
+        "Objectif": prix, "Invalidation": prix,
     })
 
     st.markdown("**Gain par action**")
