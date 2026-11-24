@@ -1047,22 +1047,25 @@ def page_alerte_achat():
 # =============================================================================
 # 12. PAGE « TEST HISTORIQUE » (backtest)
 # =============================================================================
-# Règles testées, semaine après semaine, sur les cours de clôture hebdomadaires :
-#   - ACHAT  quand le RSI hebdomadaire passe sous le seuil de survente (ex. 30)
-#            ET que la note fondamentale est ≥ 7/10
-#   - VENTE  quand le RSI hebdomadaire passe au-dessus du seuil de surachat (ex. 70)
-#   - Une seule position à la fois par action ; achat et vente au cours de clôture de la semaine.
+# On simule un PORTEFEUILLE, semaine après semaine, sur les cours de clôture hebdomadaires :
+#   - capital de départ (ex. 10 000 €), chaque achat au maximum de 1 000 € (selon l'argent disponible)
+#   - VENTE  quand le RSI hebdomadaire d'une action détenue dépasse le seuil de surachat (ex. 70)
+#   - ACHAT  quand le RSI hebdomadaire passe sous le seuil de survente (ex. 30),
+#            en commençant par les actions les plus survendues, tant qu'il reste de l'argent
+#   - Une seule position à la fois par action.
 #
-# Deux façons de noter les entreprises :
-#   - « Note de l'époque » : on ne regarde que les comptes publiés AVANT la date d'achat
-#     (3 mois après la clôture de l'exercice). C'est honnête, mais Yahoo ne donne qu'environ
-#     4 ans de comptes : le test ne couvre donc que les ~3 dernières années.
-#   - « Note d'aujourd'hui » : la note actuelle est appliquée sur 10 ans. Plus de transactions,
-#     mais résultat trop optimiste : on choisit les entreprises en sachant qu'elles vont bien aujourd'hui.
+# Filtre fondamental (au choix) :
+#   - « Aucune note »      : on achète sur le RSI seul.
+#   - « Note de l'époque » : seulement les comptes publiés AVANT l'achat (honnête, mais Yahoo ne
+#                            donne qu'environ 4 ans de comptes : peu d'achats avant ~2023).
+#   - « Note d'aujourd'hui » : note actuelle appliquée au passé (résultat trop optimiste).
 
 DELAI_PUBLICATION = pd.Timedelta(days=90)  # les comptes annuels sont publiés ~3 mois après la clôture
-MODE_EPOQUE = "Note de l'époque (honnête, ~3 dernières années)"
-MODE_AUJOURDHUI = "Note d'aujourd'hui (10 ans, trop optimiste)"
+MODE_SANS_NOTE = "Aucune note (RSI seul)"
+MODE_EPOQUE = "Note de l'époque (honnête, peu d'achats avant 2023)"
+MODE_AUJOURDHUI = "Note d'aujourd'hui (trop optimiste)"
+INDICES_YAHOO = {"CAC 40": "^FCHI", "Nasdaq 100": "^NDX", "S&P 500": "^GSPC"}  # pour la comparaison
+ACHAT_MINIMUM = 100  # on n'achète pas avec moins de 100 € disponibles
 
 
 def comptes_a_la_date(comptes, date):
@@ -1072,39 +1075,102 @@ def comptes_a_la_date(comptes, date):
             for cle, valeurs in comptes.items()}
 
 
-def simuler_action(serie, comptes, financiere, mode, seuil_achat, seuil_vente, note_min):
-    """Simule la stratégie sur une action. Renvoie la liste des transactions."""
-    indice_rsi = rsi(serie)
-    note_actuelle = analyse_fondamentale(comptes, serie, financiere)["note"]
-    if mode == MODE_AUJOURDHUI and (note_actuelle is None or note_actuelle < note_min):
-        return []
+class FiltreFondamental:
+    """Dit si une action peut être achetée à une date donnée, selon le mode choisi."""
 
-    transactions, achat = [], None
-    notes_memo = {}  # la note ne change qu'à chaque nouvelle publication de comptes : on la mémorise
-    for i in range(20, len(serie)):  # on saute les 20 premières semaines (RSI pas encore fiable)
-        date, prix, r = serie.index[i], serie.iloc[i], indice_rsi.iloc[i]
-        if achat is None and r < seuil_achat:
-            if mode == MODE_EPOQUE:
-                comptes_date = comptes_a_la_date(comptes, date)
-                cle = sum(len(v) for v in comptes_date.values())
-                if cle not in notes_memo:
-                    notes_memo[cle] = analyse_fondamentale(comptes_date, serie.iloc[:i + 1], financiere)["note"]
-                note = notes_memo[cle]
-            else:
-                note = note_actuelle
-            if note is not None and note >= note_min:
-                achat = {"date": date, "prix": prix, "note": note, "rsi": r}
-        elif achat is not None and r > seuil_vente:
-            transactions.append({**achat, "date_vente": date, "prix_vente": prix, "rsi_vente": r, "statut": "Vendue"})
-            achat = None
-    if achat is not None:  # position encore ouverte : valorisée au dernier cours
-        transactions.append({**achat, "date_vente": serie.index[-1], "prix_vente": serie.iloc[-1],
-                             "rsi_vente": indice_rsi.iloc[-1], "statut": "En cours"})
-    return transactions
+    def __init__(self, mode, cours, comptes, financieres, note_min):
+        self.mode, self.cours, self.comptes = mode, cours, comptes
+        self.financieres, self.note_min = financieres, note_min
+        self.memo = {}  # la note ne change qu'à chaque publication de comptes : on la mémorise
+
+    def note(self, ticker, date):
+        if self.mode == MODE_SANS_NOTE:
+            return None
+        if ticker not in self.comptes:
+            return None
+        serie = self.cours[ticker].dropna()
+        if self.mode == MODE_AUJOURDHUI:
+            cle = (ticker, "aujourd'hui")
+            if cle not in self.memo:
+                self.memo[cle] = analyse_fondamentale(self.comptes[ticker], serie,
+                                                      ticker in self.financieres)["note"]
+            return self.memo[cle]
+        comptes_date = comptes_a_la_date(self.comptes[ticker], date)
+        cle = (ticker, sum(len(v) for v in comptes_date.values()))
+        if cle not in self.memo:
+            self.memo[cle] = analyse_fondamentale(comptes_date, serie.loc[:date],
+                                                  ticker in self.financieres)["note"]
+        return self.memo[cle]
+
+    def autorise(self, ticker, date):
+        if self.mode == MODE_SANS_NOTE:
+            return True
+        n = self.note(ticker, date)
+        return n is not None and n >= self.note_min
 
 
-def graphique_transactions(ticker, serie, transactions, seuil_achat, seuil_vente):
+def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_achat, seuil_vente):
+    """Simulation semaine par semaine. Renvoie (transactions, évolution du portefeuille)."""
+    prix = cours[tickers].ffill()  # semaine sans cotation : on garde le dernier cours connu
+    # RSI calculé sur tout l'historique (pour qu'il soit déjà fiable à la date de départ)
+    rsis = pd.DataFrame({t: rsi(cours[t].dropna()) for t in tickers}).reindex(prix.index)
+    dates = prix.index[prix.index >= debut]
+    tableau_prix, tableau_rsi = prix.loc[dates].to_numpy(), rsis.loc[dates].to_numpy()
+
+    liquidites, positions, transactions, evolution = capital, {}, [], []
+    for i, date in enumerate(dates):
+        # 1. Ventes : actions détenues dont le RSI dépasse le seuil de surachat
+        for j in list(positions):
+            if tableau_rsi[i, j] > seuil_vente:
+                pos = positions.pop(j)
+                montant_vente = pos["parts"] * tableau_prix[i, j]
+                liquidites += montant_vente
+                transactions.append({**pos, "date_vente": date, "prix_vente": tableau_prix[i, j],
+                                     "montant_vente": montant_vente, "statut": "Vendue"})
+        # 2. Achats : les plus survendues d'abord, tant qu'il reste de l'argent
+        candidats = [(tableau_rsi[i, j], j) for j in range(len(tickers))
+                     if j not in positions and tableau_rsi[i, j] < seuil_achat and tableau_prix[i, j] > 0]
+        for r, j in sorted(candidats):
+            if liquidites < ACHAT_MINIMUM:
+                break
+            if not filtre.autorise(tickers[j], date):
+                continue
+            montant = min(mise, liquidites)
+            liquidites -= montant
+            positions[j] = {"Ticker": tickers[j], "date": date, "prix": tableau_prix[i, j], "rsi": r,
+                            "parts": montant / tableau_prix[i, j], "montant": montant,
+                            "note": filtre.note(tickers[j], date)}
+        # 3. Valeur du portefeuille cette semaine
+        investi = sum(p["parts"] * tableau_prix[i, j] for j, p in positions.items())
+        evolution.append({"date": date, "Portefeuille": liquidites + investi, "Liquidités": liquidites})
+
+    for j, pos in positions.items():  # positions encore ouvertes, valorisées au dernier cours
+        montant_vente = pos["parts"] * tableau_prix[-1, j]
+        transactions.append({**pos, "date_vente": dates[-1], "prix_vente": tableau_prix[-1, j],
+                             "montant_vente": montant_vente, "statut": "En cours"})
+    return transactions, pd.DataFrame(evolution).set_index("date")
+
+
+def graphique_evolution(evolution, capital, indice, nom_indice):
+    """Évolution de la valeur du portefeuille, comparée à l'indice et au capital de départ."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=evolution.index, y=evolution["Portefeuille"], name="Portefeuille",
+                             line=dict(color="#1f77b4", width=3)))
+    if indice is not None:
+        fig.add_trace(go.Scatter(x=indice.index, y=indice.values, name=f"{nom_indice} (même capital)",
+                                 line=dict(color="#ff7f0e", width=2)))
+    fig.add_trace(go.Scatter(x=evolution.index, y=evolution["Liquidités"], name="Dont liquidités",
+                             line=dict(color="gray", width=1, dash="dot")))
+    fig.add_hline(y=capital, line=dict(color="black", width=1, dash="dash"),
+                  annotation_text=f"Départ {capital:,.0f} €".replace(",", " "))
+    fig.update_layout(title="Évolution du portefeuille (€)", height=420, hovermode="x unified",
+                      margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.15))
+    st.plotly_chart(fig, width="stretch", config=SANS_OUTILS)
+
+
+def graphique_transactions(ticker, serie, transactions, seuil_achat, seuil_vente, debut):
     """Cours avec les achats (▲ vert) et les ventes (▼ rouge), puis le RSI avec les deux seuils."""
+    serie = serie.loc[debut - pd.Timedelta(weeks=26):]
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=serie.index, y=serie.values, name="Cours", line=dict(color="#1f77b4")))
     fig.add_trace(go.Scatter(x=[t["date"] for t in transactions], y=[t["prix"] for t in transactions],
@@ -1127,24 +1193,30 @@ def graphique_transactions(ticker, serie, transactions, seuil_achat, seuil_vente
     st.plotly_chart(fig_rsi, width="stretch", config=SANS_OUTILS)
 
 
+def euros(x):
+    return f"{x:,.0f} €".replace(",", " ")
+
+
 def page_test_historique():
     st.title("🧪 Test historique")
-    st.caption("Que se serait-il passé en achetant les bonnes entreprises en survente, "
-               "et en les revendant en surachat ?")
+    st.caption("Simulation d'un portefeuille : achat en survente (RSI bas), revente en surachat (RSI haut).")
 
     nom_indice = st.radio("Indice", ["CAC 40", "Nasdaq 100", "S&P 500"], horizontal=True, key="bt_indice")
-    mode = st.radio("Note fondamentale utilisée", [MODE_EPOQUE, MODE_AUJOURDHUI], key="bt_mode",
-                    help="« Époque » : seulement les comptes publiés avant l'achat (honnête). "
-                         "« Aujourd'hui » : note actuelle appliquée au passé (résultat trop flatteur).")
+    mode = st.radio("Filtre fondamental", [MODE_SANS_NOTE, MODE_EPOQUE, MODE_AUJOURDHUI], key="bt_mode",
+                    help="« Aucune note » : achat sur le RSI seul. « Époque » : seulement les comptes publiés "
+                         "avant l'achat. « Aujourd'hui » : note actuelle appliquée au passé (trop flatteur).")
     with st.expander("⚙️ Règles", expanded=False):
+        c1, c2 = st.columns(2)
+        capital = c1.number_input("Capital de départ (€)", 1000, 1_000_000, 10_000, 1000, key="bt_capital")
+        mise = c2.number_input("Achat maximum par ligne (€)", 100, 100_000, 1_000, 100, key="bt_mise")
+        debut = pd.Timestamp(st.date_input("Date de départ", pd.Timestamp("2020-01-01"), key="bt_debut",
+                                           format="DD/MM/YYYY"))
         seuil_achat = st.slider("Achat si RSI hebdo inférieur à", 15, 50, 30, key="bt_achat")
         seuil_vente = st.slider("Vente si RSI hebdo supérieur à", 50, 90, 70, key="bt_vente")
-        note_min = st.slider("Note fondamentale minimale", 0.0, 10.0, 7.0, 0.5, key="bt_note")
-    st.caption(f"Règles : achat si RSI < {seuil_achat} et note fondamentale ≥ {note_min:g}/10 ; "
-               f"vente si RSI > {seuil_vente}.")
-    if nom_indice == "S&P 500":
-        st.info("Le S&P 500 demande de télécharger les comptes de nombreuses entreprises : "
-                "le premier calcul peut prendre plusieurs minutes.")
+        note_min = st.slider("Note fondamentale minimale (si filtre)", 0.0, 10.0, 7.0, 0.5, key="bt_note")
+    regle_note = "" if mode == MODE_SANS_NOTE else f" et note fondamentale ≥ {note_min:g}/10"
+    st.caption(f"Départ le {debut:%d/%m/%Y} avec {euros(capital)}, {euros(mise)} maximum par achat. "
+               f"Achat si RSI < {seuil_achat}{regle_note} ; vente si RSI > {seuil_vente}.")
 
     if not st.toggle("Lancer le test", key=f"bt_lancer_{nom_indice}"):
         return
@@ -1152,113 +1224,115 @@ def page_test_historique():
     with st.spinner("Téléchargement des cours…"):
         noms, financieres = composants_indice(nom_indice)
         cours = cours_hebdo(tuple(sorted(noms)))
+        indice_brut = cours_hebdo((INDICES_YAHOO[nom_indice],))
     if cours.empty:
         st.error("Impossible de récupérer les cours. Réessayez plus tard.")
         return
-
-    # 1. On ne garde que les actions qui ont été au moins une fois en survente (pour limiter les téléchargements)
-    candidats = [t for t in noms if t in cours.columns and len(cours[t].dropna()) > 60
-                 and (rsi(cours[t].dropna()).iloc[20:] < seuil_achat).any()]
-    if not candidats:
-        st.info("Aucune action n'a été en survente sur la période.")
+    if debut >= cours.index[-1]:
+        st.error("La date de départ doit être dans le passé.")
         return
+    tickers = [t for t in noms if t in cours.columns and cours[t].notna().sum() > 30]
 
-    # 2. Comptes annuels de ces actions
-    comptes, erreurs = comptes_annuels(candidats)
-    if erreurs:
-        st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : elles sont exclues du test. "
-                   "Patientez quelques minutes puis appuyez sur « Réessayer ».")
-        if st.button("🔄 Réessayer", key="bt_reessayer"):
-            st.rerun()
+    # Comptes annuels : seulement si un filtre fondamental est utilisé (et seulement pour
+    # les actions qui ont été au moins une fois en survente depuis la date de départ)
+    comptes = {}
+    if mode != MODE_SANS_NOTE:
+        candidats = [t for t in tickers if (rsi(cours[t].dropna()).loc[debut:] < seuil_achat).any()]
+        comptes, erreurs = comptes_annuels(candidats)
+        if erreurs:
+            st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : elles ne seront pas achetées. "
+                       "Patientez quelques minutes puis appuyez sur « Réessayer ».")
+            if st.button("🔄 Réessayer", key="bt_reessayer"):
+                st.rerun()
 
-    # 3. Simulation action par action
-    transactions = []
-    for t in candidats:
-        if t not in comptes:
-            continue
-        for tr in simuler_action(cours[t].dropna(), comptes[t], t in financieres, mode,
-                                 seuil_achat, seuil_vente, note_min):
-            transactions.append({"Ticker": t, "Nom": noms[t], **tr})
-    if not transactions:
-        st.info("Aucune transaction : aucune action n'a rempli les conditions d'achat sur la période. "
-                "Essayez un seuil d'achat plus haut (ex. 40) ou une note minimale plus basse.")
-        return
+    filtre = FiltreFondamental(mode, cours, comptes, financieres, note_min)
+    transactions, evolution = simuler_portefeuille(cours, tickers, filtre, debut, capital, mise,
+                                                   seuil_achat, seuil_vente)
 
-    df = pd.DataFrame(transactions)
-    df["Rendement %"] = (df["prix_vente"] / df["prix"] - 1) * 100
-    df["Durée (sem.)"] = ((df["date_vente"] - df["date"]).dt.days / 7).round().astype(int)
-
-    # 4. Comparaison avec « acheter et garder » chaque action depuis son premier achat
-    comparaison = []
-    for t, groupe in df.groupby("Ticker"):
-        serie = cours[t].dropna()
-        strategie = ((1 + groupe["Rendement %"] / 100).prod() - 1) * 100  # gains enchaînés
-        conserver = (serie.iloc[-1] / groupe["prix"].iloc[0] - 1) * 100
-        comparaison.append({"Ticker": t, "Nom": noms[t], "Transactions": len(groupe),
-                            "Stratégie %": strategie, "Acheter et garder %": conserver})
-    comparaison = pd.DataFrame(comparaison).sort_values("Stratégie %", ascending=False)
+    # Indice de comparaison : même capital placé dans l'indice à la date de départ
+    indice = None
+    if not indice_brut.empty:
+        serie_indice = indice_brut.iloc[:, 0].dropna().loc[debut:]
+        if not serie_indice.empty:
+            indice = capital * serie_indice / serie_indice.iloc[0]
 
     # --- Résumé ---
-    vendues = df[df["statut"] == "Vendue"]
-    debut = df["date"].min()
+    final = evolution["Portefeuille"].iloc[-1]
+    gain = final - capital
+    plus_haut = evolution["Portefeuille"].cummax()
+    pire_baisse = ((evolution["Portefeuille"] / plus_haut - 1).min()) * 100
     st.subheader("📊 Résultats")
-    st.caption(f"Premier achat le {debut:%d/%m/%Y} · dernière semaine {cours.index[-1]:%d/%m/%Y} · "
-               "cours ajustés des dividendes.")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Transactions", len(df), help="Dont les positions encore ouvertes")
-    c2.metric("Gagnantes", f"{(df['Rendement %'] > 0).mean():.0%}")
-    c3.metric("Gain moyen / transaction", f"{df['Rendement %'].mean():+.1f} %")
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Durée moyenne", f"{df['Durée (sem.)'].mean():.0f} sem.")
-    c5.metric("Pire transaction", f"{df['Rendement %'].min():+.1f} %")
-    c6.metric("En cours", int((df["statut"] == "En cours").sum()))
-    c7, c8 = st.columns(2)
-    c7.metric("Stratégie (moyenne par action)", f"{comparaison['Stratégie %'].mean():+.1f} %")
-    c8.metric("Acheter et garder (moyenne)", f"{comparaison['Acheter et garder %'].mean():+.1f} %",
-              help="Si on avait acheté au premier signal et jamais revendu")
-    if not vendues.empty:
-        st.caption(f"Sur les {len(vendues)} transactions terminées : gain moyen {vendues['Rendement %'].mean():+.1f} %, "
-                   f"{(vendues['Rendement %'] > 0).mean():.0%} gagnantes.")
+    c1, c2 = st.columns(2)
+    c1.metric("Valeur finale", euros(final), f"{gain / capital:+.1%}")
+    c2.metric(f"{nom_indice} (même capital)", euros(indice.iloc[-1]) if indice is not None else "—",
+              f"{indice.iloc[-1] / capital - 1:+.1%}" if indice is not None else None)
+    c3, c4 = st.columns(2)
+    c3.metric("Gain / perte", euros(gain))
+    c4.metric("Pire baisse en cours de route", f"{pire_baisse:.1f} %",
+              help="Plus forte chute de la valeur du portefeuille depuis un sommet")
+
+    graphique_evolution(evolution, capital, indice, nom_indice)
+    st.caption("L'indice est sans les dividendes, alors que les actions du portefeuille les incluent. "
+               "Les montants des actions américaines sont en dollars, comptés comme des euros. "
+               "Frais de courtage et impôts non compris.")
     if mode == MODE_AUJOURDHUI:
         st.warning("⚠️ Résultat trop optimiste : les entreprises sont choisies avec leur note d'aujourd'hui, "
                    "c'est-à-dire en sachant déjà qu'elles se portent bien.")
 
+    if not transactions:
+        st.info("Aucun achat sur la période. Essayez un seuil d'achat plus haut (ex. 40).")
+        return
+
+    df = pd.DataFrame(transactions)
+    df["Nom"] = df["Ticker"].map(noms)
+    df["Rendement %"] = (df["prix_vente"] / df["prix"] - 1) * 100
+    df["Gain €"] = df["montant_vente"] - df["montant"]
+    df["Durée (sem.)"] = ((df["date_vente"] - df["date"]).dt.days / 7).round().astype(int)
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Achats", len(df))
+    c6.metric("Gagnants", f"{(df['Rendement %'] > 0).mean():.0%}")
+    c7.metric("En cours", int((df["statut"] == "En cours").sum()))
+
     # --- Tableaux ---
     prix = st.column_config.NumberColumn(format="%.2f")
     pct = st.column_config.NumberColumn(format="%+.1f %%")
-    st.markdown("**Par action : stratégie contre « acheter et garder »**")
-    st.dataframe(comparaison, hide_index=True, width="stretch", column_config={
-        "Ticker": st.column_config.TextColumn(pinned=True),
-        "Nom": st.column_config.TextColumn(width="medium"),
-        "Stratégie %": pct, "Acheter et garder %": pct})
-
+    eur = st.column_config.NumberColumn(format="%.0f €")
     st.markdown("**Toutes les transactions**")
     detail = df.sort_values("date", ascending=False).rename(columns={
-        "date": "Achat le", "prix": "Prix achat", "note": "Note fond.", "rsi": "RSI achat",
-        "date_vente": "Vente le", "prix_vente": "Prix vente", "rsi_vente": "RSI vente", "statut": "Statut"})
-    st.dataframe(
-        detail[["Ticker", "Nom", "Achat le", "Prix achat", "Vente le", "Prix vente", "Rendement %",
-                "Durée (sem.)", "Statut", "Note fond.", "RSI achat", "RSI vente"]],
-        hide_index=True, width="stretch",
-        column_config={
-            "Ticker": st.column_config.TextColumn(pinned=True),
-            "Nom": st.column_config.TextColumn(width="medium"),
-            "Achat le": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Vente le": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Prix achat": prix, "Prix vente": prix, "Rendement %": pct,
-            "Note fond.": st.column_config.NumberColumn(format="%.1f"),
-            "RSI achat": st.column_config.NumberColumn(format="%.0f"),
-            "RSI vente": st.column_config.NumberColumn(format="%.0f"),
-        })
+        "date": "Achat le", "prix": "Prix achat", "montant": "Investi", "date_vente": "Vente le",
+        "prix_vente": "Prix vente", "statut": "Statut", "note": "Note fond.", "rsi": "RSI achat"})
+    colonnes = ["Ticker", "Nom", "Achat le", "Investi", "Gain €", "Rendement %", "Vente le", "Statut",
+                "Durée (sem.)", "Prix achat", "Prix vente", "RSI achat"]
+    if mode != MODE_SANS_NOTE:
+        colonnes.append("Note fond.")
+    st.dataframe(detail[colonnes], hide_index=True, width="stretch", column_config={
+        "Ticker": st.column_config.TextColumn(pinned=True),
+        "Nom": st.column_config.TextColumn(width="medium"),
+        "Achat le": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        "Vente le": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        "Investi": eur, "Gain €": st.column_config.NumberColumn(format="%+.0f €"),
+        "Prix achat": prix, "Prix vente": prix, "Rendement %": pct,
+        "Note fond.": st.column_config.NumberColumn(format="%.1f"),
+        "RSI achat": st.column_config.NumberColumn(format="%.0f"),
+    })
+
+    st.markdown("**Gain par action**")
+    par_action = (df.groupby(["Ticker", "Nom"])
+                  .agg(Achats=("Gain €", "size"), Investi=("montant", "sum"), Gain=("Gain €", "sum"))
+                  .reset_index().sort_values("Gain", ascending=False))
+    st.dataframe(par_action, hide_index=True, width="stretch", column_config={
+        "Ticker": st.column_config.TextColumn(pinned=True),
+        "Nom": st.column_config.TextColumn(width="medium"),
+        "Investi": eur, "Gain": st.column_config.NumberColumn("Gain €", format="%+.0f €")})
 
     # --- Graphique d'une action ---
     st.divider()
-    choix = st.selectbox("Voir les achats et ventes de", comparaison["Ticker"],
+    choix = st.selectbox("Voir les achats et ventes de", par_action["Ticker"],
                          format_func=lambda t: f"{t} — {noms.get(t, t)}", key="bt_choix")
     graphique_transactions(choix, cours[choix].dropna(), [tr for tr in transactions if tr["Ticker"] == choix],
-                           seuil_achat, seuil_vente)
-    st.caption("Les performances passées ne préjugent pas des performances futures. "
-               "Le test ne tient pas compte des frais de courtage ni des impôts.")
+                           seuil_achat, seuil_vente, debut)
+    st.caption("Les performances passées ne préjugent pas des performances futures.")
 
 
 # =============================================================================
