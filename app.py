@@ -946,7 +946,7 @@ def main():
 #   - ET la note fondamentale est supérieure ou égale à 7 (l'entreprise est solide)
 
 RSI_ALERTE = 40  # valeur proposée par défaut ; réglable avec le curseur de la page
-NOTE_FOND_ALERTE = 7
+NOTE_FOND_ALERTE = 7.0  # valeur proposée par défaut ; réglable avec le curseur de la page
 
 
 def page_alerte_achat():
@@ -956,8 +956,13 @@ def page_alerte_achat():
                           help="Plus le seuil est bas, plus l'action doit avoir baissé fortement "
                                "(30 = survente classique). Plus il est haut, plus il y a d'alertes, "
                                "et plus le calcul est long (comptes de chaque action à télécharger).")
+    # Curseur : note fondamentale minimale (santé financière de l'entreprise)
+    note_min = st.slider("Note fondamentale minimale (sur 10)", 0.0, 10.0, NOTE_FOND_ALERTE, 0.5,
+                         key="alerte_note",
+                         help="Plus la note est haute, plus l'entreprise doit être solide "
+                              "(croissance, rentabilité, free cash flow, dette, PER). 7 = bonne santé.")
     st.caption(f"Actions avec un **RSI hebdomadaire < {seuil_rsi}** et une "
-               f"**note fondamentale ≥ {NOTE_FOND_ALERTE}/10**.")
+               f"**note fondamentale ≥ {note_min:g}/10**.")
 
     indices = st.multiselect("Indices surveillés", ["CAC 40", "Nasdaq 100", "S&P 500"],
                              default=["CAC 40", "Nasdaq 100", "S&P 500"], key="alerte_indices")
@@ -999,7 +1004,7 @@ def page_alerte_achat():
         if t not in comptes:
             continue
         f = analyse_fondamentale(comptes[t], series[t], t in financieres_toutes)
-        if f["note"] is not None and f["note"] >= NOTE_FOND_ALERTE:
+        if f["note"] is not None and f["note"] >= note_min:
             alertes.append({**c, "Note fondamentale": f["note"],
                             "Croissance CA %/an": f["chiffres"].get("croissance_ca"),
                             "PER": f["chiffres"].get("per")})
@@ -1016,7 +1021,7 @@ def page_alerte_achat():
 
     if not alertes:
         st.info(f"Aucune action ne remplit les deux conditions pour le moment "
-                f"(note fondamentale ≥ {NOTE_FOND_ALERTE} et RSI < {seuil_rsi}).")
+                f"(note fondamentale ≥ {note_min:g} et RSI < {seuil_rsi}).")
         return
 
     # Tableau trié du RSI le plus bas (le plus survendu) au plus haut
