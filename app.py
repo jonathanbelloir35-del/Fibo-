@@ -1119,11 +1119,19 @@ class FiltreFondamental:
         return n is not None and n >= self.note_min
 
 
+def rsi_fiable(serie, semaines_ignorees=30):
+    """RSI, sauf pendant les 30 premières semaines de cotation : sans assez d'historique,
+    le RSI d'une action tout juste introduite en bourse peut valoir 0 et donner un faux signal d'achat."""
+    r = rsi(serie)
+    r.iloc[:semaines_ignorees] = float("nan")
+    return r
+
+
 def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_achat, seuil_vente):
     """Simulation semaine par semaine. Renvoie (transactions, évolution du portefeuille)."""
     prix = cours[tickers].ffill()  # semaine sans cotation : on garde le dernier cours connu
     # RSI calculé sur tout l'historique (pour qu'il soit déjà fiable à la date de départ)
-    rsis = pd.DataFrame({t: rsi(cours[t].dropna()) for t in tickers}).reindex(prix.index)
+    rsis = pd.DataFrame({t: rsi_fiable(cours[t].dropna()) for t in tickers}).reindex(prix.index)
     dates = prix.index[prix.index >= debut]
     tableau_prix, tableau_rsi = prix.loc[dates].to_numpy(), rsis.loc[dates].to_numpy()
 
@@ -1247,7 +1255,7 @@ def page_test_historique():
     # les actions qui ont été au moins une fois en survente depuis la date de départ)
     comptes = {}
     if mode != MODE_SANS_NOTE:
-        candidats = [t for t in tickers if (rsi(cours[t].dropna()).loc[debut:] < seuil_achat).any()]
+        candidats = [t for t in tickers if (rsi_fiable(cours[t].dropna()).loc[debut:] < seuil_achat).any()]
         comptes, erreurs = comptes_annuels(candidats)
         if erreurs:
             st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : elles ne seront pas achetées. "
