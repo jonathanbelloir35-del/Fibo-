@@ -938,5 +938,120 @@ def main():
     fiche_action(choix, noms.get(choix, choix), cours[choix].dropna(), choix in financieres)
 
 
-main()
+# =============================================================================
+# 11. PAGE « ALERTE ACHAT »
+# =============================================================================
+# Regroupe, sur les indices choisis, les actions dont :
+#   - le RSI hebdomadaire est inférieur à 40 (l'action a beaucoup baissé récemment)
+#   - ET la note fondamentale est supérieure ou égale à 7 (l'entreprise est solide)
+
+RSI_ALERTE = 40
+NOTE_FOND_ALERTE = 7
+
+
+def page_alerte_achat():
+    st.title("🚨 Alerte achat")
+    st.caption(f"Actions avec un **RSI hebdomadaire < {RSI_ALERTE}** et une "
+               f"**note fondamentale ≥ {NOTE_FOND_ALERTE}/10**.")
+
+    indices = st.multiselect("Indices surveillés", ["CAC 40", "Nasdaq 100", "S&P 500"],
+                             default=["CAC 40", "Nasdaq 100", "S&P 500"], key="alerte_indices")
+    if not indices:
+        st.info("Choisissez au moins un indice.")
+        return
+
+    # --- 1. RSI de toutes les actions (rapide : seulement les cours) ---
+    candidats = []  # une ligne par action avec RSI < 40
+    noms_tous, financieres_toutes, series = {}, set(), {}
+    with st.spinner("Téléchargement des cours (1 à 2 minutes la première fois)…"):
+        for nom_indice in indices:
+            noms, financieres = composants_indice(nom_indice)
+            cours = cours_hebdo(tuple(sorted(noms)))
+            if cours.empty:
+                st.warning(f"Cours indisponibles pour le {nom_indice}.")
+                continue
+            tableau = notes_techniques(noms, cours)
+            if tableau.empty:
+                continue
+            financieres_toutes |= financieres
+            for _, ligne in tableau[tableau["RSI"] < RSI_ALERTE].iterrows():
+                if ligne["Ticker"] in series:  # action présente dans 2 indices (ex. Nasdaq 100 et S&P 500)
+                    continue
+                series[ligne["Ticker"]] = cours[ligne["Ticker"]].dropna()
+                noms_tous[ligne["Ticker"]] = ligne["Nom"]
+                candidats.append({**ligne.to_dict(), "Indice": nom_indice})
+
+    if not candidats:
+        st.success(f"Aucune action n'a un RSI hebdomadaire inférieur à {RSI_ALERTE} en ce moment.")
+        return
+
+    # --- 2. Note fondamentale de ces actions seulement (plus lent) ---
+    st.caption(f"{len(candidats)} action(s) avec un RSI < {RSI_ALERTE} : calcul de leur note fondamentale…")
+    comptes, erreurs = comptes_annuels([c["Ticker"] for c in candidats])
+    alertes = []
+    for c in candidats:
+        t = c["Ticker"]
+        if t not in comptes:
+            continue
+        f = analyse_fondamentale(comptes[t], series[t], t in financieres_toutes)
+        if f["note"] is not None and f["note"] >= NOTE_FOND_ALERTE:
+            alertes.append({**c, "Note fondamentale": f["note"],
+                            "Croissance CA %/an": f["chiffres"].get("croissance_ca"),
+                            "PER": f["chiffres"].get("per")})
+
+    if erreurs:
+        st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : la liste est peut-être incomplète. "
+                   "Yahoo limite sans doute les requêtes : patientez quelques minutes puis appuyez sur « Réessayer ».")
+        if st.button("🔄 Réessayer", key="alerte_reessayer"):
+            st.rerun()
+
+    c1, c2 = st.columns(2)
+    c1.metric(f"RSI < {RSI_ALERTE}", len(candidats))
+    c2.metric("🚨 Alertes achat", len(alertes))
+
+    if not alertes:
+        st.info(f"Aucune action ne remplit les deux conditions pour le moment "
+                f"(note fondamentale ≥ {NOTE_FOND_ALERTE} et RSI < {RSI_ALERTE}).")
+        return
+
+    # Tableau trié du RSI le plus bas (le plus survendu) au plus haut
+    resultat = pd.DataFrame(alertes).sort_values("RSI")
+    prix = st.column_config.NumberColumn(format="%.2f")
+    colonnes = ["Ticker", "Nom", "RSI", "Note fondamentale", "Note technique", "Cours", "Indice",
+                "Écart 200 WMA %", "Croissance CA %/an", "PER", "Seuil 1", "Seuil 2", "Seuil 3", "Stop"]
+    st.dataframe(
+        resultat[colonnes], hide_index=True, width="stretch",
+        column_config={
+            "Ticker": st.column_config.TextColumn(pinned=True),
+            "Nom": st.column_config.TextColumn(width="medium"),
+            "RSI": st.column_config.NumberColumn(format="%.0f"),
+            "Note fondamentale": st.column_config.NumberColumn("Note fond.", format="%.1f /10"),
+            "Note technique": st.column_config.NumberColumn("Note tech.", format="%.1f /10"),
+            "Cours": prix, "Seuil 1": prix, "Seuil 2": prix, "Seuil 3": prix, "Stop": prix,
+            "Écart 200 WMA %": st.column_config.NumberColumn(format="%+.1f %%"),
+            "Croissance CA %/an": st.column_config.NumberColumn(format="%+.1f %%"),
+            "PER": st.column_config.NumberColumn(format="%.1f"),
+        },
+    )
+    st.caption("Trié du RSI le plus bas au plus haut. Un RSI bas signale une forte baisse récente : "
+               "attendez de préférence que le rebond commence (voir la fiche). "
+               "Faites glisser le tableau pour voir toutes les colonnes.")
+
+    # --- Fiche action ---
+    st.divider()
+    choix = st.selectbox("Voir la fiche de l'action", resultat["Ticker"],
+                         format_func=lambda t: f"{t} — {noms_tous.get(t, t)}", key="alerte_choix")
+    fiche_action(choix, noms_tous.get(choix, choix), series[choix], choix in financieres_toutes)
+
+
+# =============================================================================
+# 12. NAVIGATION ENTRE LES PAGES
+# =============================================================================
+# Des boutons en haut de page plutôt qu'un menu latéral : plus pratique sur iPhone.
+page = st.radio("Page", ["🎯 Opportunités", "🚨 Alerte achat"], horizontal=True,
+                label_visibility="collapsed", key="page")
+if page == "🎯 Opportunités":
+    main()
+else:
+    page_alerte_achat()
 st.caption("⚠️ Outil d'aide à la réflexion, pas un conseil en investissement. Données : Yahoo Finance.")
