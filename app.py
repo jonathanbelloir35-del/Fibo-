@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Application Streamlit : Scanner 200 WMA + Portefeuille avec objectifs Fibonacci.
+Fibo – Opportunités
+===================
 
-Écran 1 "Scanner"      : repère les actions proches de leur moyenne mobile 200 semaines.
-Écran 2 "Portefeuille" : calcule un objectif de vente avec un ZigZag + extension 2,618.
+Un seul écran :
+  1. Choix de l'indice (CAC 40, Nasdaq 100, S&P 500).
+  2. Un tableau avec, pour chaque action :
+       - une NOTE TECHNIQUE sur 10  (200 WMA, Fibonacci, RSI hebdo, rebond)
+       - une NOTE FONDAMENTALE sur 10 (chiffre d'affaires, rentabilité, free cash flow, dette, PER)
+  3. Une liste déroulante pour ouvrir la FICHE d'une action, avec ses graphiques.
+
+Données : Yahoo Finance (bibliothèque yfinance), cours hebdomadaires sur 10 ans.
 
 Lancer en local :  streamlit run app.py
 """
@@ -18,30 +25,30 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-# ---------------------------------------------------------------------------
-# Configuration générale de la page
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Scanner 200 WMA & Portefeuille",
-    page_icon="📈",
-    layout="wide",  # utilise toute la largeur (s'adapte aussi à l'écran d'un iPhone)
-)
+st.set_page_config(page_title="Fibo – Opportunités", page_icon="🎯", layout="wide")
 
-# Durée du cache : 24 heures (en secondes). Les données ne sont retéléchargées qu'une fois par jour.
-CACHE_24H = 24 * 60 * 60
 
-# Nombre de semaines pour la moyenne mobile
-PERIODE_WMA = 200
+# =============================================================================
+# 1. RÉGLAGES (modifiables)
+# =============================================================================
 
-# En-tête "navigateur" pour que Wikipédia accepte nos requêtes
-ENTETES_HTTP = {"User-Agent": "Mozilla/5.0 (compatible; scanner-streamlit/1.0)"}
+CACHE_24H = 24 * 60 * 60  # les données sont retéléchargées au plus une fois par jour
+PERIODE_WMA = 200  # moyenne mobile 200 semaines
+SEUIL_ZIGZAG = 0.20  # 20 % : taille minimale d'une vague pour le ZigZag
 
-# ---------------------------------------------------------------------------
-# Listes des indices
-# ---------------------------------------------------------------------------
+# Seuils de la note fondamentale
+CROISSANCE_CA_BONNE = 0.05  # croissance annuelle du chiffre d'affaires ≥ 5 %
+ROE_BON = 0.12  # rentabilité des capitaux propres ≥ 12 %
+DETTE_EBITDA_BONNE = 1.5  # dette nette / EBITDA < 1,5 = 2 points ; < 3 = 1 point
 
-# CAC 40 : liste écrite "en dur" (la composition change rarement).
-# Si un titre entre ou sort de l'indice, il suffit de modifier cette liste.
+ENTETES_HTTP = {"User-Agent": "Mozilla/5.0 (compatible; fibo-streamlit/2.0)"}
+
+
+# =============================================================================
+# 2. LISTES DES ACTIONS DE CHAQUE INDICE
+# =============================================================================
+
+# CAC 40 : liste écrite à la main (à mettre à jour si la composition change)
 CAC40 = {
     "AC.PA": "Accor",
     "AI.PA": "Air Liquide",
@@ -85,8 +92,10 @@ CAC40 = {
     "DG.PA": "Vinci",
 }
 
-# Liste de secours pour le Nasdaq 100 (utilisée seulement si Wikipédia est inaccessible).
-# La composition change chaque année en décembre : mettez-la à jour si besoin.
+# Banques et assurances du CAC 40 : pour elles, dette et free cash flow ne veulent rien dire
+FINANCIERES_CAC40 = {"BNP.PA", "ACA.PA", "GLE.PA", "CS.PA"}
+
+# Nasdaq 100 : liste de secours, utilisée seulement si Wikipédia ne répond pas
 NASDAQ100_SECOURS = {
     "AAPL": "Apple",
     "ABNB": "Airbnb",
@@ -194,308 +203,126 @@ NASDAQ100_SECOURS = {
 }
 
 
-def tableau_wikipedia(url, colonnes_ticker, colonnes_nom):
+def lire_wikipedia(url, colonnes_ticker, colonnes_nom):
     """Lit le tableau des composants d'un indice sur Wikipédia.
 
-    `colonnes_ticker` / `colonnes_nom` : noms de colonnes possibles (Wikipédia les change parfois).
-    Renvoie un dictionnaire {ticker: nom}.
+    Renvoie (noms, financieres) : {ticker: nom} et l'ensemble des tickers du secteur financier.
     """
     reponse = requests.get(url, headers=ENTETES_HTTP, timeout=20)
     reponse.raise_for_status()
-    # pandas sait lire tous les tableaux HTML d'une page
-    tableaux = pd.read_html(StringIO(reponse.text))
-    for tableau in tableaux:
-        # Certains tableaux ont des en-têtes sur 2 lignes : on garde la dernière
-        if isinstance(tableau.columns, pd.MultiIndex):
+    for tableau in pd.read_html(StringIO(reponse.text)):
+        if isinstance(tableau.columns, pd.MultiIndex):  # en-têtes sur 2 lignes
             tableau.columns = tableau.columns.get_level_values(-1)
         col_ticker = next((c for c in colonnes_ticker if c in tableau.columns), None)
         col_nom = next((c for c in colonnes_nom if c in tableau.columns), None)
         if col_ticker is None or col_nom is None or len(tableau) < 50:
             continue  # ce n'est pas le bon tableau
-        resultat = {}
-        for _, ligne in tableau.iterrows():
-            # Yahoo Finance écrit "BRK-B" et non "BRK.B"
-            ticker = str(ligne[col_ticker]).strip().replace(".", "-")
-            resultat[ticker] = str(ligne[col_nom]).strip()
-        return resultat
+        # Yahoo Finance écrit "BRK-B" et non "BRK.B"
+        tickers = tableau[col_ticker].astype(str).str.strip().str.replace(".", "-", regex=False)
+        noms = dict(zip(tickers, tableau[col_nom].astype(str).str.strip()))
+        col_secteur = next((c for c in tableau.columns if "Sector" in str(c) or "Industry" in str(c)), None)
+        financieres = set()
+        if col_secteur is not None:
+            financieres = set(tickers[tableau[col_secteur].astype(str).str.contains("Financ")])
+        return noms, financieres
     raise ValueError("Tableau des composants introuvable")
 
 
-COLONNES_TICKER = ["Ticker", "Symbol", "Ticker symbol"]
-COLONNES_NOM = ["Company", "Security", "Name", "Company name"]
-
-
 @st.cache_data(ttl=CACHE_24H, show_spinner=False)
-def liste_nasdaq100():
-    """Composants du Nasdaq 100 (Wikipédia, sinon liste de secours)."""
-    try:
-        resultat = tableau_wikipedia(
-            "https://en.wikipedia.org/wiki/Nasdaq-100", COLONNES_TICKER, COLONNES_NOM
-        )
-        if 90 <= len(resultat) <= 110:  # vérification : environ 100 sociétés
-            return resultat
-    except Exception:
-        pass
-    return dict(NASDAQ100_SECOURS)
-
-
-@st.cache_data(ttl=CACHE_24H, show_spinner=False)
-def liste_sp500():
-    """Composants du S&P 500 (Wikipédia, sinon un fichier CSV public sur GitHub)."""
-    try:
-        return tableau_wikipedia(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            COLONNES_TICKER,
-            COLONNES_NOM,
-        )
-    except Exception:
-        url_csv = (
-            "https://raw.githubusercontent.com/datasets/"
-            "s-and-p-500-companies/main/data/constituents.csv"
-        )
-        reponse = requests.get(url_csv, headers=ENTETES_HTTP, timeout=20)
-        df = pd.read_csv(StringIO(reponse.text))
-        return {
-            str(s).replace(".", "-"): str(n)
-            for s, n in zip(df["Symbol"], df["Security"])
-        }
-
-
 def composants_indice(nom_indice):
-    """Renvoie {ticker: nom} pour l'indice choisi."""
+    """Renvoie (noms, financieres) pour l'indice choisi."""
     if nom_indice == "CAC 40":
-        return CAC40
+        return dict(CAC40), set(FINANCIERES_CAC40)
+
+    colonnes_ticker = ["Ticker", "Symbol", "Ticker symbol"]
+    colonnes_nom = ["Company", "Security", "Name", "Company name"]
+
     if nom_indice == "Nasdaq 100":
-        return liste_nasdaq100()
-    return liste_sp500()
+        try:
+            noms, financieres = lire_wikipedia(
+                "https://en.wikipedia.org/wiki/Nasdaq-100", colonnes_ticker, colonnes_nom)
+            if 90 <= len(noms) <= 110:  # vérification : environ 100 sociétés
+                return noms, financieres
+        except Exception:
+            pass
+        return dict(NASDAQ100_SECOURS), set()
+
+    # S&P 500 : Wikipédia, sinon un fichier CSV public sur GitHub
+    try:
+        return lire_wikipedia(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", colonnes_ticker, colonnes_nom)
+    except Exception:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        df = pd.read_csv(StringIO(requests.get(url, headers=ENTETES_HTTP, timeout=20).text))
+        tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False)
+        financieres = set(tickers[df["GICS Sector"].astype(str).str.contains("Financ")])
+        return dict(zip(tickers, df["Security"].astype(str))), financieres
 
 
-# ---------------------------------------------------------------------------
-# Téléchargement des cours (yfinance)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 3. TÉLÉCHARGEMENT DES DONNÉES (Yahoo Finance)
+# =============================================================================
 
 
 @st.cache_data(ttl=CACHE_24H, show_spinner=False)
 def cours_hebdo(tickers):
-    """Télécharge les cours de clôture HEBDOMADAIRES sur 10 ans.
+    """Cours de clôture HEBDOMADAIRES sur 10 ans : une ligne par semaine, une colonne par action.
 
     `tickers` est un tuple (et non une liste) pour que le cache fonctionne.
-    Renvoie un tableau : une ligne par semaine, une colonne par ticker.
     """
     morceaux = []
     tickers = list(tickers)
-    # On télécharge par paquets de 100 pour ne pas surcharger Yahoo Finance
-    for debut in range(0, len(tickers), 100):
-        paquet = tickers[debut : debut + 100]
-        donnees = yf.download(
-            paquet,
-            period="10y",
-            interval="1wk",
-            auto_adjust=True,  # cours ajustés des dividendes et divisions
-            progress=False,
-            threads=True,
-        )
+    for debut in range(0, len(tickers), 100):  # par paquets de 100 pour ménager Yahoo
+        paquet = tickers[debut:debut + 100]
+        donnees = yf.download(paquet, period="10y", interval="1wk", auto_adjust=True,
+                              progress=False, threads=True)
         if donnees is None or donnees.empty:
             continue
         clotures = donnees["Close"]
-        # Avec un seul ticker, yfinance peut renvoyer une simple colonne
-        if isinstance(clotures, pd.Series):
+        if isinstance(clotures, pd.Series):  # un seul ticker
             clotures = clotures.to_frame(name=paquet[0])
         morceaux.append(clotures)
-
     if not morceaux:
         return pd.DataFrame()
     resultat = pd.concat(morceaux, axis=1)
-    resultat = resultat.loc[:, ~resultat.columns.duplicated()]
-    return resultat.sort_index()
+    return resultat.loc[:, ~resultat.columns.duplicated()].sort_index()
 
 
-def serie_cours(ticker):
-    """Cours hebdomadaires d'un seul ticker (Series sans valeurs vides)."""
-    df = cours_hebdo((ticker,))
-    if df.empty or ticker not in df.columns:
-        return pd.Series(dtype=float)
-    return df[ticker].dropna()
-
-
-# ---------------------------------------------------------------------------
-# Calculs : ZigZag et objectif Fibonacci
-# ---------------------------------------------------------------------------
-
-
-def zigzag(serie, seuil):
-    """Détecte les sommets et les creux avec un ZigZag en pourcentage.
-
-    - `serie` : cours de clôture (pandas Series indexée par date)
-    - `seuil` : variation minimale, ex. 0.20 pour 20 %
-
-    Un sommet est "confirmé" quand le cours a ensuite baissé d'au moins `seuil`,
-    un creux est confirmé quand le cours a ensuite monté d'au moins `seuil`.
-
-    Renvoie (pivots_confirmes, dernier_pivot_provisoire)
-    où chaque pivot est un dict {date, prix, type} avec type = "creux" ou "sommet".
-    """
-    valeurs = serie.values
-    dates = serie.index
-    if len(valeurs) < 2:
-        return [], None
-
-    pivots = []
-    tendance = None  # "hausse", "baisse" ou None (pas encore déterminée)
-    i_haut = i_bas = 0  # plus haut / plus bas depuis le début (avant la 1re tendance)
-    i_extreme = 0  # point extrême de la tendance en cours
-
-    for i in range(1, len(valeurs)):
-        v = valeurs[i]
-
-        if tendance is None:
-            # Phase de démarrage : on attend un premier mouvement >= seuil
-            if v > valeurs[i_haut]:
-                i_haut = i
-            if v < valeurs[i_bas]:
-                i_bas = i
-            if v >= valeurs[i_bas] * (1 + seuil):
-                pivots.append({"date": dates[i_bas], "prix": valeurs[i_bas], "type": "creux"})
-                tendance, i_extreme = "hausse", i
-            elif v <= valeurs[i_haut] * (1 - seuil):
-                pivots.append({"date": dates[i_haut], "prix": valeurs[i_haut], "type": "sommet"})
-                tendance, i_extreme = "baisse", i
-
-        elif tendance == "hausse":
-            if v > valeurs[i_extreme]:
-                i_extreme = i  # nouveau plus haut : le sommet se déplace
-            elif v <= valeurs[i_extreme] * (1 - seuil):
-                # Baisse suffisante : le sommet est confirmé
-                pivots.append({"date": dates[i_extreme], "prix": valeurs[i_extreme], "type": "sommet"})
-                tendance, i_extreme = "baisse", i
-
-        else:  # tendance == "baisse"
-            if v < valeurs[i_extreme]:
-                i_extreme = i  # nouveau plus bas : le creux se déplace
-            elif v >= valeurs[i_extreme] * (1 + seuil):
-                # Hausse suffisante : le creux est confirmé
-                pivots.append({"date": dates[i_extreme], "prix": valeurs[i_extreme], "type": "creux"})
-                tendance, i_extreme = "hausse", i
-
-    provisoire = None
-    if tendance is not None:
-        provisoire = {
-            "date": dates[i_extreme],
-            "prix": valeurs[i_extreme],
-            "type": "sommet" if tendance == "hausse" else "creux",
-        }
-    return pivots, provisoire
-
-
-def points_abc(pivots):
-    """Trouve la dernière séquence creux A -> sommet B -> creux C (pivots confirmés).
-
-    Renvoie (A, B, C) ou None si le ZigZag n'a pas encore assez de points.
-    """
-    for k in range(len(pivots) - 1, 1, -1):
-        a, b, c = pivots[k - 2], pivots[k - 1], pivots[k]
-        if a["type"] == "creux" and b["type"] == "sommet" and c["type"] == "creux":
-            return a, b, c
-    return None
-
-
-def objectif_vente(a, b, c):
-    """Objectif de vente = C + 2,618 x (B - A)."""
-    return c["prix"] + 2.618 * (b["prix"] - a["prix"])
-
-
-# ---------------------------------------------------------------------------
-# Score qualité (analyse fondamentale)
-# ---------------------------------------------------------------------------
-# 5 critères, 1 point chacun :
-#   1. Croissance du chiffre d'affaires   2. Rentabilité (ROE et marge)
-#   3. Free cash flow positif             4. Endettement raisonnable
-#   5. PER actuel inférieur ou égal à son PER moyen des années précédentes
-# Un critère sans données (ou non applicable, ex. la dette pour une banque)
-# n'est pas compté : le score s'affiche alors sur 4 ou sur 3.
-#
-# Toutes les données viennent des comptes annuels publiés (environ 4 ans),
-# téléchargés UNIQUEMENT pour les actions ayant un signal ACHAT, doucement
-# (3 à la fois) pour ne pas être bloqué par Yahoo Finance.
-
-# Seuils des critères (modifiables)
-CROISSANCE_CA_MIN = 0.05  # croissance annuelle moyenne du CA : 5 %
-ROE_MIN = 0.12  # rentabilité des capitaux propres : 12 %
-DETTE_EBITDA_MAX = 2.5  # dette nette / EBITDA
-
-# Banques et assurances du CAC 40 (pour elles, dette et free cash flow ne veulent rien dire)
-FINANCIERES_CAC40 = {"BNP.PA", "ACA.PA", "GLE.PA", "CS.PA"}
-
-
-@st.cache_data(ttl=CACHE_24H, show_spinner=False)
-def financieres_us(nom_indice):
-    """Liste des tickers du secteur financier (Nasdaq 100 / S&P 500), lue sur Wikipédia."""
-    sources = {
-        "Nasdaq 100": ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker"),
-        "S&P 500": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
-    }
-    url, colonne_ticker = sources[nom_indice]
-    try:
-        reponse = requests.get(url, headers=ENTETES_HTTP, timeout=20)
-        for tableau in pd.read_html(StringIO(reponse.text)):
-            colonnes_secteur = [c for c in tableau.columns if "Sector" in str(c) or "Industry" in str(c)]
-            if colonne_ticker in tableau.columns and colonnes_secteur and len(tableau) > 50:
-                secteur = tableau[colonnes_secteur[0]].astype(str)
-                tickers = tableau[colonne_ticker].astype(str).str.replace(".", "-", regex=False)
-                return set(tickers[secteur.str.contains("Financ")])
-    except Exception:
-        pass
-    return set()
-
-
-def est_financiere(ticker, nom_indice):
-    if nom_indice == "CAC 40":
-        return ticker in FINANCIERES_CAC40
-    return ticker in financieres_us(nom_indice)
-
-
-def _serie_comptable(tableau, noms):
-    """Extrait une ligne d'un état financier : Series {date de clôture: valeur}, de la plus ancienne à la plus récente."""
+def _ligne_comptable(tableau, noms):
+    """Une ligne d'un état financier : {date de clôture: valeur}, de la plus ancienne à la plus récente."""
     if tableau is None or tableau.empty:
-        return pd.Series(dtype=float)
+        return {}
     for nom in noms:
         if nom in tableau.index:
-            return pd.to_numeric(tableau.loc[nom], errors="coerce").dropna().sort_index()
-    return pd.Series(dtype=float)
-
-
-def _valeurs(serie):
-    return [float(v) for v in serie.values]
+            serie = pd.to_numeric(tableau.loc[nom], errors="coerce").dropna().sort_index()
+            return {str(d.date()): float(v) for d, v in serie.items()}
+    return {}
 
 
 def _telecharger_comptes(ticker):
-    """Télécharge les comptes annuels d'une action, avec 3 tentatives.
+    """Comptes annuels d'une action (environ 4 ans), avec 3 tentatives.
 
-    Renvoie (donnees, None) si tout va bien, ou (None, message_d_erreur).
+    Renvoie (comptes, None) si tout va bien, sinon (None, message d'erreur).
     """
-    erreur = "réponse vide de Yahoo Finance"
+    erreur = "réponse vide"
     for tentative in range(3):
         try:
             action = yf.Ticker(ticker)
-            compte = action.income_stmt
-            if compte is None or compte.empty:
+            resultat = action.income_stmt
+            if resultat is None or resultat.empty:
                 raise ValueError("compte de résultat vide (Yahoo limite peut-être les requêtes)")
-            bilan = action.balance_sheet
-            flux = action.cashflow
-            bpa = _serie_comptable(compte, ["Diluted EPS", "Basic EPS"])
-            donnees = {
-                "ca": _valeurs(_serie_comptable(compte, ["Total Revenue", "Operating Revenue"])),
-                "resultat_op": _valeurs(_serie_comptable(compte, ["Operating Income"])),
-                "resultat_net": _valeurs(_serie_comptable(compte, ["Net Income", "Net Income Common Stockholders"])),
-                "ebitda": _valeurs(_serie_comptable(compte, ["EBITDA", "Normalized EBITDA"])),
-                "bpa": {str(d.date()): float(v) for d, v in bpa.items()},  # bénéfice par action par année
-                "capitaux_propres": _valeurs(_serie_comptable(bilan, ["Stockholders Equity", "Common Stock Equity"])),
-                "dette": _valeurs(_serie_comptable(bilan, ["Total Debt"])),
-                "tresorerie": _valeurs(_serie_comptable(
-                    bilan, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])),
-                "fcf": _valeurs(_serie_comptable(flux, ["Free Cash Flow"])),
-            }
-            return donnees, None
+            bilan, flux = action.balance_sheet, action.cashflow
+            return {
+                "ca": _ligne_comptable(resultat, ["Total Revenue", "Operating Revenue"]),
+                "resultat_net": _ligne_comptable(resultat, ["Net Income", "Net Income Common Stockholders"]),
+                "ebitda": _ligne_comptable(resultat, ["EBITDA", "Normalized EBITDA"]),
+                "bpa": _ligne_comptable(resultat, ["Diluted EPS", "Basic EPS"]),
+                "capitaux_propres": _ligne_comptable(bilan, ["Stockholders Equity", "Common Stock Equity"]),
+                "dette": _ligne_comptable(bilan, ["Total Debt"]),
+                "tresorerie": _ligne_comptable(
+                    bilan, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"]),
+                "fcf": _ligne_comptable(flux, ["Free Cash Flow"]),
+            }, None
         except Exception as e:
             erreur = str(e) or e.__class__.__name__
             time.sleep(2 + 3 * tentative)  # on patiente un peu plus à chaque essai
@@ -504,576 +331,96 @@ def _telecharger_comptes(ticker):
 
 @st.cache_resource(show_spinner=False)
 def _memoire_comptes():
-    """Mémoire partagée {ticker: (heure, données)} : on n'y garde QUE les réussites."""
+    """Mémoire partagée {ticker: (heure, comptes)}. On n'y garde QUE les réussites,
+    pour que les échecs (blocage Yahoo) soient retentés plus tard."""
     return {}
 
 
-def comptes_annuels(tickers):
-    """Comptes des actions demandées. Renvoie (resultats, erreurs).
-
-    Les réussites sont gardées 24 h ; les échecs seront retentés au prochain affichage.
-    """
-    memoire = _memoire_comptes()
-    maintenant = time.time()
-    resultats, erreurs = {}, {}
+def comptes_annuels(tickers, afficher_progression=True):
+    """Comptes annuels de plusieurs actions. Renvoie (comptes, erreurs)."""
+    memoire, maintenant = _memoire_comptes(), time.time()
+    comptes, erreurs = {}, {}
     a_telecharger = []
     for t in tickers:
         if t in memoire and maintenant - memoire[t][0] < CACHE_24H:
-            resultats[t] = memoire[t][1]
+            comptes[t] = memoire[t][1]
         else:
             a_telecharger.append(t)
+    if not a_telecharger:
+        return comptes, erreurs
 
-    if a_telecharger:
-        barre = st.progress(0.0, text="Téléchargement des comptes annuels…")
-        # 3 téléchargements à la fois seulement, pour ne pas être bloqué par Yahoo
-        with ThreadPoolExecutor(max_workers=3) as executeur:
-            taches = {executeur.submit(_telecharger_comptes, t): t for t in a_telecharger}
-            for n, tache in enumerate(as_completed(taches), start=1):
-                t = taches[tache]
-                donnees, erreur = tache.result()
-                if donnees is not None:
-                    memoire[t] = (time.time(), donnees)
-                    resultats[t] = donnees
-                else:
-                    erreurs[t] = erreur
+    barre = st.progress(0.0, text="Comptes annuels…") if afficher_progression else None
+    with ThreadPoolExecutor(max_workers=3) as executeur:  # 3 à la fois seulement, pour ne pas être bloqué
+        taches = {executeur.submit(_telecharger_comptes, t): t for t in a_telecharger}
+        for n, tache in enumerate(as_completed(taches), start=1):
+            t = taches[tache]
+            donnees, erreur = tache.result()
+            if donnees is not None:
+                memoire[t] = (time.time(), donnees)
+                comptes[t] = donnees
+            else:
+                erreurs[t] = erreur
+            if barre:
                 barre.progress(n / len(a_telecharger), text=f"Comptes annuels : {n}/{len(a_telecharger)}")
+    if barre:
         barre.empty()
-    return resultats, erreurs
+    return comptes, erreurs
 
 
-def score_qualite(comptes, cours, financiere):
-    """Évalue les 5 critères. Renvoie (points, nb_criteres_evalues, liste_des_criteres).
-
-    Chaque critère est un dict : nom, ok (True / False / None si non évaluable), détail.
-    """
-    criteres = []
-
-    # 1. Croissance du chiffre d'affaires
-    ca = comptes["ca"][-4:]
-    if len(ca) >= 2 and ca[0] > 0:
-        annees = len(ca) - 1
-        croissance_moy = (ca[-1] / ca[0]) ** (1 / annees) - 1
-        derniere = ca[-1] / ca[-2] - 1
-        criteres.append({
-            "nom": "Croissance du chiffre d'affaires",
-            "ok": croissance_moy > CROISSANCE_CA_MIN and derniere >= 0,
-            "detail": f"{croissance_moy:+.1%} par an sur {annees} an(s), dernière année {derniere:+.1%} "
-                      f"(il faut > {CROISSANCE_CA_MIN:.0%} par an et pas de recul)",
-        })
-    else:
-        criteres.append({"nom": "Croissance du chiffre d'affaires", "ok": None, "detail": "Données absentes"})
-
-    # 2. Rentabilité : ROE = résultat net / capitaux propres, et marge opérationnelle stable
-    net, cp = comptes["resultat_net"], comptes["capitaux_propres"]
-    if net and cp and cp[-1] > 0:
-        roe = net[-1] / cp[-1]
-        ok = roe >= ROE_MIN
-        detail = f"ROE {roe:.1%} (il faut ≥ {ROE_MIN:.0%})"
-        res_op, tout_ca = comptes["resultat_op"], comptes["ca"]
-        if not financiere and len(res_op) >= 2 and len(tout_ca) >= 2 and tout_ca[-1] and tout_ca[-2]:
-            marges = [res_op[-2] / tout_ca[-2], res_op[-1] / tout_ca[-1]]
-            ok = ok and marges[1] >= marges[0] - 0.01  # tolérance d'un point
-            detail += f", marge opérationnelle {marges[0]:.1%} → {marges[1]:.1%} (ne doit pas baisser)"
-        criteres.append({"nom": "Rentabilité", "ok": ok, "detail": detail})
-    elif net and cp and cp[-1] <= 0:
-        criteres.append({"nom": "Rentabilité", "ok": False, "detail": "Capitaux propres négatifs"})
-    else:
-        criteres.append({"nom": "Rentabilité", "ok": None, "detail": "Données absentes"})
-
-    # 3. Free cash flow positif sur les 2 dernières années
-    fcf = comptes["fcf"][-2:]
-    if financiere:
-        criteres.append({"nom": "Free cash flow", "ok": None, "detail": "Non applicable (banque / assurance)"})
-    elif fcf:
-        texte = ", ".join(f"{v / 1e9:+.2f} Md" for v in fcf)
-        criteres.append({"nom": "Free cash flow", "ok": all(v > 0 for v in fcf),
-                         "detail": f"{texte} (doit être positif)"})
-    else:
-        criteres.append({"nom": "Free cash flow", "ok": None, "detail": "Données absentes"})
-
-    # 4. Endettement : dette nette / EBITDA
-    dette, treso, ebitda = comptes["dette"], comptes["tresorerie"], comptes["ebitda"]
-    if financiere:
-        criteres.append({"nom": "Endettement", "ok": None, "detail": "Non applicable (banque / assurance)"})
-    elif dette or treso:
-        dette_nette = (dette[-1] if dette else 0) - (treso[-1] if treso else 0)
-        if dette_nette <= 0:
-            criteres.append({"nom": "Endettement", "ok": True, "detail": "Plus de trésorerie que de dettes"})
-        elif ebitda and ebitda[-1] > 0:
-            ratio = dette_nette / ebitda[-1]
-            criteres.append({"nom": "Endettement", "ok": ratio < DETTE_EBITDA_MAX,
-                             "detail": f"Dette nette / EBITDA = {ratio:.1f} (il faut < {DETTE_EBITDA_MAX})"})
-        elif ebitda:
-            criteres.append({"nom": "Endettement", "ok": False, "detail": "Endettée avec un EBITDA négatif"})
-        else:
-            criteres.append({"nom": "Endettement", "ok": None, "detail": "EBITDA absent"})
-    else:
-        criteres.append({"nom": "Endettement", "ok": None, "detail": "Données absentes"})
-
-    # 5. PER actuel vs PER moyen des années précédentes
-    #    PER d'une année = cours à la date de clôture des comptes / bénéfice par action de l'année
-    bpa = pd.Series(comptes["bpa"], dtype=float)
-    bpa.index = pd.to_datetime(bpa.index)
-    bpa = bpa.sort_index()
-    if bpa.empty or cours.empty:
-        criteres.append({"nom": "PER vs son historique", "ok": None, "detail": "Données absentes"})
-    elif bpa.iloc[-1] <= 0:
-        criteres.append({"nom": "PER vs son historique", "ok": False, "detail": "L'entreprise perd de l'argent"})
-    else:
-        per_actuel = cours.iloc[-1] / bpa.iloc[-1]
-        per_passes = []
-        for date, b in bpa.iloc[:-1].items():
-            prix = cours.asof(date)  # cours de la semaine de clôture des comptes
-            if b > 0 and pd.notna(prix):
-                per_passes.append(prix / b)
-        if len(per_passes) >= 2:
-            moyenne = sum(per_passes) / len(per_passes)
-            criteres.append({"nom": "PER vs son historique", "ok": per_actuel <= moyenne,
-                             "detail": f"PER actuel {per_actuel:.1f} contre {moyenne:.1f} en moyenne "
-                                       f"les {len(per_passes)} années précédentes (doit être ≤)"})
-        else:
-            criteres.append({"nom": "PER vs son historique", "ok": None, "detail": "Historique trop court"})
-
-    evalues = [c for c in criteres if c["ok"] is not None]
-    points = sum(1 for c in evalues if c["ok"])
-    return points, len(evalues), criteres
-
-
-def verdict(points, evalues):
-    """Transforme le score en verdict lisible."""
-    if evalues < 3:
-        return "⚪ Données insuffisantes"
-    ratio = points / evalues
-    if ratio >= 0.8:
-        return "🟢 ACHAT"
-    if ratio >= 0.4:
-        return "🟡 À surveiller"
-    return "🔴 Piège possible"
-
-
-def section_qualite(nom_indice, cours, tableau):
-    """Affiche le score qualité des actions ayant un signal ACHAT technique."""
-    st.subheader("🏅 Score qualité")
-    st.caption(
-        "Vérifie la santé de l'entreprise pour éviter les « pièges » : croissance du CA, "
-        "rentabilité, free cash flow, dette, PER par rapport à son historique."
-    )
-    candidats = tableau[tableau["Signal"] != ""]
-    if candidats.empty:
-        st.info("Aucun signal ACHAT technique à analyser.")
-        return
-    if not st.toggle(f"Calculer le score qualité des {len(candidats)} signaux ACHAT", key=f"qualite_{nom_indice}"):
-        st.caption("Le premier calcul peut prendre quelques minutes (puis il est gardé 24 h).")
-        return
-
-    comptes, erreurs = comptes_annuels(list(candidats["Ticker"]))
-
-    if erreurs:
-        st.warning(
-            f"Données indisponibles pour {len(erreurs)} action(s) sur {len(candidats)}. "
-            "Yahoo Finance limite sans doute le nombre de requêtes : patientez quelques minutes "
-            "puis appuyez sur « Réessayer »."
-        )
-        if st.button("🔄 Réessayer", key=f"reessayer_{nom_indice}"):
-            st.rerun()
-        with st.expander("Détails techniques"):
-            for t, e in erreurs.items():
-                st.text(f"{t} : {e}")
-
-    lignes, fiches = [], {}
-    for _, ligne in candidats.iterrows():
-        t = ligne["Ticker"]
-        if t not in comptes:
-            continue
-        points, evalues, criteres = score_qualite(
-            comptes[t], cours[t].dropna(), est_financiere(t, nom_indice)
-        )
-        fiches[t] = (ligne["Nom"], points, evalues, criteres)
-        lignes.append({
-            "Ticker": t,
-            "Nom": ligne["Nom"],
-            "Écart %": ligne["Écart %"],
-            "Qualité": f"{points}/{evalues}",
-            "Verdict": verdict(points, evalues),
-            "_tri": points / evalues if evalues >= 3 else -1,  # données insuffisantes en bas
-        })
-
-    if not lignes:
-        return
-
-    resultat = pd.DataFrame(lignes).sort_values(["_tri", "Écart %"], ascending=[False, True])
-    st.dataframe(
-        resultat.drop(columns="_tri"),
-        hide_index=True,
-        width="stretch",
-        column_config={"Écart %": st.column_config.NumberColumn(format="%+.1f %%")},
-    )
-    st.caption("🟢 ≥ 80 % des critères · 🟡 40 à 79 % · 🔴 < 40 % · ⚪ moins de 3 critères évaluables")
-
-    # Fiche détaillée : explique chaque critère
-    choix = st.selectbox(
-        "Fiche détaillée", resultat["Ticker"],
-        format_func=lambda t: f"{t} — {fiches[t][0]}",
-    )
-    nom, points, evalues, criteres = fiches[choix]
-    st.markdown(f"**{nom}** : {points}/{evalues} → {verdict(points, evalues)}")
-    for c in criteres:
-        icone = {True: "✅", False: "❌", None: "➖"}[c["ok"]]
-        st.markdown(f"{icone} **{c['nom']}** — {c['detail']}")
-
-
-# ---------------------------------------------------------------------------
-# Écran 1 : Scanner
-# ---------------------------------------------------------------------------
-
-
-def ecran_scanner():
-    st.header("🔎 Scanner 200 WMA")
-    st.caption(
-        "Moyenne mobile simple sur 200 semaines. "
-        "Signal **ACHAT** si le cours est ≤ 200 WMA × 1,05, "
-        "puis un score qualité vérifie la santé de l'entreprise."
-    )
-
-    nom_indice = st.radio(
-        "Indice", ["CAC 40", "Nasdaq 100", "S&P 500"], horizontal=True
-    )
-
-    with st.spinner("Téléchargement des données (peut prendre 1 à 2 minutes la première fois)…"):
-        composants = composants_indice(nom_indice)
-        cours = cours_hebdo(tuple(sorted(composants)))
-
-    if cours.empty:
-        st.error("Impossible de récupérer les cours. Réessayez plus tard.")
-        return
-
-    # Calcul de la 200 WMA pour chaque action
-    lignes = []
-    ignorees = []  # actions écartées, avec la raison
-    for ticker, nom in composants.items():
-        if ticker not in cours.columns or cours[ticker].dropna().empty:
-            ignorees.append({"Ticker": ticker, "Nom": nom, "Raison": "Pas de données Yahoo Finance"})
-            continue
-        serie = cours[ticker].dropna()
-        if len(serie) < PERIODE_WMA:  # pas assez d'historique : on ignore
-            ignorees.append({"Ticker": ticker, "Nom": nom,
-                             "Raison": f"Seulement {len(serie)} semaines d'historique"})
-            continue
-        wma = serie.rolling(PERIODE_WMA).mean().iloc[-1]
-        prix = serie.iloc[-1]
-        ecart = (prix / wma - 1) * 100
-        lignes.append(
-            {
-                "Ticker": ticker,
-                "Nom": nom,
-                "Cours": prix,
-                "200 WMA": wma,
-                "Écart %": ecart,
-                "Signal": "🟢 ACHAT" if prix <= wma * 1.05 else "",
-            }
-        )
-
-    if not lignes:
-        st.warning("Aucune action avec assez d'historique.")
-        return
-
-    tableau = pd.DataFrame(lignes).sort_values("Écart %").reset_index(drop=True)
-    nb_achats = (tableau["Signal"] != "").sum()
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Actions analysées", len(tableau))
-    col2.metric("Signaux ACHAT", int(nb_achats))
-    col3.metric("Ignorées", len(ignorees))
-
-    tableau_complet = tableau
-    if st.toggle("Afficher seulement les signaux ACHAT"):
-        tableau = tableau[tableau["Signal"] != ""]
-
-    # Recherche d'une action par ticker ou par nom
-    recherche = st.text_input("🔍 Rechercher une action (ticker ou nom)", placeholder="ex. NVDA ou Nvidia")
-    if recherche.strip():
-        texte = recherche.strip().lower()
-        tableau = tableau[
-            tableau["Ticker"].str.lower().str.contains(texte, regex=False)
-            | tableau["Nom"].str.lower().str.contains(texte, regex=False)
-        ]
-        if tableau.empty:
-            st.info("Aucune action trouvée dans le tableau (elle est peut-être dans la liste des ignorées, plus bas).")
-
-    st.caption("Tableau trié de l'écart le plus bas au plus haut. Faites glisser le doigt dans le tableau pour voir la suite.")
-
-    st.dataframe(
-        tableau,
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "Cours": st.column_config.NumberColumn(format="%.2f"),
-            "200 WMA": st.column_config.NumberColumn(format="%.2f"),
-            "Écart %": st.column_config.NumberColumn(format="%+.1f %%"),
-        },
-    )
-    st.caption(f"Dernière semaine de données : {cours.index[-1]:%d/%m/%Y}. Données mises en cache 24 h.")
-
-    # Ouvrir la fiche détaillée (timing d'achat) d'une action du tableau
-    if not tableau.empty:
-        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
-        choix = c1.selectbox("Voir la fiche de", tableau["Ticker"],
-                             format_func=lambda t: f"{t} — {composants.get(t, t)}")
-        c2.button("📋 Ouvrir", on_click=ouvrir_fiche, args=(choix,), width="stretch")
-
-    if ignorees:
-        with st.expander(f"Actions ignorées ({len(ignorees)})"):
-            st.caption(f"Il faut au moins {PERIODE_WMA} semaines de cours pour calculer la 200 WMA.")
-            st.dataframe(pd.DataFrame(ignorees), hide_index=True, width="stretch")
-
-    # Score qualité calculé sur le tableau complet (pas seulement le filtre affiché)
-    section_qualite(nom_indice, cours, tableau_complet)
-
-
-# ---------------------------------------------------------------------------
-# Écran 2 : Portefeuille
-# ---------------------------------------------------------------------------
-
-# Le portefeuille est aussi enregistré dans l'adresse (URL) de la page :
-# si vous rechargez la page ou l'ajoutez à l'écran d'accueil de l'iPhone,
-# vos lignes sont conservées.
-
-
-def portefeuille_vers_url():
-    """Écrit le portefeuille dans l'URL, ex. ?p=AAPL:150:10,MC.PA:600:2"""
-    texte = ",".join(
-        f"{l['ticker']}:{l['prix_achat']:g}:{l['quantite']:g}"
-        for l in st.session_state.portefeuille
-    )
-    if texte:
-        st.query_params["p"] = texte
-    elif "p" in st.query_params:
-        del st.query_params["p"]
-
-
-def portefeuille_depuis_url():
-    """Lit le portefeuille depuis l'URL (au premier chargement de la page)."""
-    lignes = []
-    texte = st.query_params.get("p", "")
-    for morceau in texte.split(","):
-        try:
-            ticker, prix, qte = morceau.split(":")
-            lignes.append(
-                {"ticker": ticker.upper(), "prix_achat": float(prix), "quantite": float(qte)}
-            )
-        except ValueError:
-            continue  # morceau mal formé : on l'ignore
-    return lignes
-
-
-def graphique(ticker, serie, wma, pivots, provisoire, abc, objectif):
-    """Graphique : cours, 200 WMA, ZigZag, points A/B/C et ligne d'objectif."""
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=serie.index, y=serie.values, name="Cours", line=dict(color="#1f77b4")))
-    fig.add_trace(go.Scatter(x=wma.index, y=wma.values, name="200 WMA", line=dict(color="#ff7f0e")))
-
-    # Ligne brisée du ZigZag
-    points = pivots + ([provisoire] if provisoire else [])
-    if points:
-        fig.add_trace(
-            go.Scatter(
-                x=[p["date"] for p in points],
-                y=[p["prix"] for p in points],
-                name="ZigZag",
-                mode="lines+markers",
-                line=dict(color="gray", dash="dot", width=1),
-                marker=dict(size=5),
-            )
-        )
-
-    # Points A, B, C
-    if abc:
-        fig.add_trace(
-            go.Scatter(
-                x=[p["date"] for p in abc],
-                y=[p["prix"] for p in abc],
-                mode="markers+text",
-                text=["A", "B", "C"],
-                textposition="top center",
-                marker=dict(size=11, color="purple"),
-                name="A / B / C",
-            )
-        )
-
-    # Ligne horizontale de l'objectif
-    if objectif is not None:
-        fig.add_hline(
-            y=objectif,
-            line=dict(color="green", dash="dash"),
-            annotation_text=f"Objectif {objectif:.2f}",
-            annotation_position="top left",
-        )
-
-    fig.update_layout(
-        title=ticker,
-        height=420,
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h", y=-0.15),  # légende sous le graphique (mieux sur mobile)
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig, width="stretch")
-
-
-def ecran_portefeuille():
-    st.header("💼 Portefeuille")
-    st.caption(
-        "Objectif de vente = C + 2,618 × (B − A), avec A = dernier creux majeur, "
-        "B = sommet suivant, C = creux suivant (ZigZag). "
-        "Signal **VENTE** si cours ≥ objectif × 0,97."
-    )
-
-    # Initialisation du portefeuille (depuis l'URL si possible)
-    if "portefeuille" not in st.session_state:
-        st.session_state.portefeuille = portefeuille_depuis_url()
-
-    # --- Formulaire d'ajout d'une ligne ---
-    with st.form("ajout", clear_on_submit=True):
-        st.subheader("Ajouter une ligne")
-        ticker = st.text_input("Ticker (ex. AAPL, MC.PA)")
-        c1, c2 = st.columns(2)
-        prix_achat = c1.number_input("Prix d'achat", min_value=0.0, step=1.0, format="%.2f")
-        quantite = c2.number_input("Quantité", min_value=0.0, step=1.0, format="%g")
-        if st.form_submit_button("➕ Ajouter", width="stretch"):
-            if ticker.strip() and prix_achat > 0 and quantite > 0:
-                st.session_state.portefeuille.append(
-                    {"ticker": ticker.strip().upper(), "prix_achat": prix_achat, "quantite": quantite}
-                )
-                portefeuille_vers_url()
-            else:
-                st.warning("Renseignez un ticker, un prix d'achat et une quantité.")
-
-    seuil_pct = st.slider("Seuil du ZigZag (%)", min_value=5, max_value=50, value=20, step=1)
-    seuil = seuil_pct / 100
-
-    if not st.session_state.portefeuille:
-        st.info("Votre portefeuille est vide. Ajoutez une ligne ci-dessus.")
-        return
-
-    # --- Calculs pour chaque ligne ---
-    resultats = []
-    details = []
-    for position, ligne in enumerate(st.session_state.portefeuille):
-        t = ligne["ticker"]
-        with st.spinner(f"Chargement de {t}…"):
-            serie = serie_cours(t)
-        if serie.empty:
-            st.warning(f"Pas de données pour {t} (ticker incorrect ?).")
-            details.append(None)
-            continue
-
-        prix = serie.iloc[-1]
-        wma = serie.rolling(PERIODE_WMA).mean()
-        pivots, provisoire = zigzag(serie, seuil)
-        abc = points_abc(pivots)
-        objectif = objectif_vente(*abc) if abc else None
-
-        valeur_achat = ligne["prix_achat"] * ligne["quantite"]
-        plus_value = (prix - ligne["prix_achat"]) * ligne["quantite"]
-
-        resultats.append(
-            {
-                "Ticker": t,
-                "Cours": prix,
-                "Objectif": objectif,
-                "% restant": (objectif / prix - 1) * 100 if objectif else None,
-                "Plus-value": plus_value,
-                "Plus-value %": plus_value / valeur_achat * 100 if valeur_achat else None,
-                "Signal": "🔴 VENTE" if objectif and prix >= objectif * 0.97 else "",
-            }
-        )
-        details.append((position, t, serie, wma, pivots, provisoire, abc, objectif, prix))
-
-    # --- Tableau récapitulatif ---
-    if resultats:
-        st.subheader("Récapitulatif")
-        st.dataframe(
-            pd.DataFrame(resultats),
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "Cours": st.column_config.NumberColumn(format="%.2f"),
-                "Objectif": st.column_config.NumberColumn(format="%.2f"),
-                "% restant": st.column_config.NumberColumn(format="%+.1f %%"),
-                "Plus-value": st.column_config.NumberColumn(format="%+.2f"),
-                "Plus-value %": st.column_config.NumberColumn(format="%+.1f %%"),
-            },
-        )
-        st.caption("Les montants sont dans la devise de chaque action (€ pour .PA, $ pour les actions US).")
-
-    # --- Détail et graphique par ligne ---
-    st.subheader("Détail par ligne")
-    for detail, ligne in zip(details, st.session_state.portefeuille):
-        if detail is None:
-            continue
-        position, t, serie, wma, pivots, provisoire, abc, objectif, prix = detail
-        titre = f"{t} — {ligne['quantite']:g} × {ligne['prix_achat']:.2f}"
-        with st.expander(titre):
-            if abc:
-                a, b, c = abc
-                st.write(
-                    f"**A** (creux) : {a['prix']:.2f} le {a['date']:%d/%m/%Y}  \n"
-                    f"**B** (sommet) : {b['prix']:.2f} le {b['date']:%d/%m/%Y}  \n"
-                    f"**C** (creux) : {c['prix']:.2f} le {c['date']:%d/%m/%Y}  \n"
-                    f"**Objectif** : {objectif:.2f} — cours actuel {prix:.2f}"
-                )
-            else:
-                st.info(
-                    "Pas encore de séquence creux → sommet → creux avec ce seuil. "
-                    "Essayez un seuil plus petit."
-                )
-            graphique(t, serie, wma, pivots, provisoire, abc, objectif)
-            if st.button("🗑️ Supprimer cette ligne", key=f"suppr_{position}"):
-                st.session_state.portefeuille.pop(position)
-                portefeuille_vers_url()
-                st.rerun()
-
-    # --- Sauvegarde / chargement en CSV (sauvegarde de secours) ---
-    with st.expander("💾 Sauvegarder / charger le portefeuille (CSV)"):
-        csv = pd.DataFrame(st.session_state.portefeuille).to_csv(index=False)
-        st.download_button("Télécharger le CSV", csv, "portefeuille.csv", "text/csv")
-        fichier = st.file_uploader("Charger un CSV", type="csv")
-        if fichier is not None and st.button("Remplacer le portefeuille par ce fichier"):
-            df = pd.read_csv(fichier)
-            st.session_state.portefeuille = [
-                {
-                    "ticker": str(r["ticker"]).upper(),
-                    "prix_achat": float(r["prix_achat"]),
-                    "quantite": float(r["quantite"]),
-                }
-                for _, r in df.iterrows()
-            ]
-            portefeuille_vers_url()
-            st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Écran 3 : Fiche action (timing d'achat + score qualité)
-# ---------------------------------------------------------------------------
-# Le timing d'achat répond à 3 questions :
-#   1. Contexte     : la tendance de fond est-elle saine ?
-#   2. Zone         : le cours est-il sur un niveau d'achat intéressant ?
-#                     (retracement de Fibonacci 38,2 %–61,8 % de la dernière hausse, ou 200 WMA)
-#   3. Confirmation : le rebond a-t-il commencé ?
-
-ECRAN_FICHE = "📋 Fiche action"
-FIBO_HAUT, FIBO_MILIEU, FIBO_BAS = 0.382, 0.5, 0.618  # niveaux de retracement
+# =============================================================================
+# 4. OUTILS D'ANALYSE TECHNIQUE
+# =============================================================================
 
 
 def rsi(serie, periode=14):
-    """RSI (Relative Strength Index) de Wilder : 0 à 100. Sous 30 = survendu, au-dessus de 70 = suracheté."""
+    """RSI de Wilder (0 à 100). Sous 30 = survendu, au-dessus de 70 = suracheté."""
     variation = serie.diff()
     hausses = variation.clip(lower=0).ewm(alpha=1 / periode, adjust=False).mean()
     baisses = (-variation.clip(upper=0)).ewm(alpha=1 / periode, adjust=False).mean()
     return 100 - 100 / (1 + hausses / baisses)
 
 
-def derniere_jambe_haussiere(pivots, provisoire):
-    """Dernière hausse du ZigZag : (creux de départ, sommet). Le sommet peut être provisoire."""
+def zigzag(serie, seuil):
+    """Repère les sommets et les creux : un sommet est confirmé quand le cours a ensuite
+    baissé d'au moins `seuil` (ex. 0.20), un creux quand il a ensuite monté d'au moins `seuil`.
+
+    Renvoie (pivots confirmés, dernier pivot provisoire) ; un pivot = {date, prix, type}.
+    """
+    valeurs, dates = serie.values, serie.index
+    pivots, tendance = [], None
+    i_haut = i_bas = i_ext = 0
+    for i in range(1, len(valeurs)):
+        v = valeurs[i]
+        if tendance is None:  # démarrage : on attend un premier mouvement suffisant
+            i_haut = i if v > valeurs[i_haut] else i_haut
+            i_bas = i if v < valeurs[i_bas] else i_bas
+            if v >= valeurs[i_bas] * (1 + seuil):
+                pivots.append({"date": dates[i_bas], "prix": valeurs[i_bas], "type": "creux"})
+                tendance, i_ext = "hausse", i
+            elif v <= valeurs[i_haut] * (1 - seuil):
+                pivots.append({"date": dates[i_haut], "prix": valeurs[i_haut], "type": "sommet"})
+                tendance, i_ext = "baisse", i
+        elif tendance == "hausse":
+            if v > valeurs[i_ext]:
+                i_ext = i
+            elif v <= valeurs[i_ext] * (1 - seuil):
+                pivots.append({"date": dates[i_ext], "prix": valeurs[i_ext], "type": "sommet"})
+                tendance, i_ext = "baisse", i
+        else:
+            if v < valeurs[i_ext]:
+                i_ext = i
+            elif v >= valeurs[i_ext] * (1 + seuil):
+                pivots.append({"date": dates[i_ext], "prix": valeurs[i_ext], "type": "creux"})
+                tendance, i_ext = "hausse", i
+    provisoire = None
+    if tendance:
+        provisoire = {"date": dates[i_ext], "prix": valeurs[i_ext],
+                      "type": "sommet" if tendance == "hausse" else "creux"}
+    return pivots, provisoire
+
+
+def derniere_hausse(pivots, provisoire):
+    """Dernière vague de hausse du ZigZag : (creux de départ, sommet). Le sommet peut être provisoire."""
     points = pivots + ([provisoire] if provisoire else [])
     for k in range(len(points) - 2, -1, -1):
         if points[k]["type"] == "creux" and points[k + 1]["type"] == "sommet":
@@ -1081,441 +428,514 @@ def derniere_jambe_haussiere(pivots, provisoire):
     return None
 
 
-def analyse_timing(serie, seuil):
-    """Analyse technique du moment d'achat. Renvoie un dictionnaire avec tous les éléments."""
+def note_sur_10(criteres):
+    """Note sur 10 : chaque critère vaut 2 points. Les critères sans données ne comptent pas.
+    Il faut au moins 3 critères évaluables, sinon la note est None."""
+    evalues = [c for c in criteres if c["points"] is not None]
+    if len(evalues) < 3:
+        return None
+    return round(sum(c["points"] for c in evalues) / (2 * len(evalues)) * 10, 1)
+
+
+# =============================================================================
+# 5. NOTE TECHNIQUE (sur 10)
+# =============================================================================
+# 5 critères à 2 points :
+#   1. Position par rapport à la 200 WMA   (proche de la moyenne = intéressant)
+#   2. 200 WMA en hausse                   (tendance de fond saine)
+#   3. Retracement de Fibonacci            (repli de 38,2 à 61,8 % de la dernière hausse)
+#   4. RSI hebdomadaire                    (pas suracheté, et qui remonte)
+#   5. Rebond : clôture au-dessus de la moyenne 10 semaines
+
+
+def analyse_technique(serie, seuil=SEUIL_ZIGZAG):
     prix = serie.iloc[-1]
     wma = serie.rolling(PERIODE_WMA).mean()
     mm10 = serie.rolling(10).mean()
     indice_rsi = rsi(serie)
     pivots, provisoire = zigzag(serie, seuil)
-    controles = []  # liste de (groupe, nom, ok True/False/None, détail)
+    criteres = []
 
-    # --- 1. Contexte ---
-    if wma.notna().sum() > 20:
-        ok = wma.iloc[-1] > wma.iloc[-21]
-        controles.append(("Contexte", "200 WMA en hausse", ok,
-                          f"{wma.iloc[-21]:.2f} il y a 20 semaines → {wma.iloc[-1]:.2f} aujourd'hui"))
-    else:
-        controles.append(("Contexte", "200 WMA en hausse", None, "Historique trop court"))
-
-    creux = [p for p in pivots if p["type"] == "creux"]
-    if len(creux) >= 2:
-        ok = creux[-1]["prix"] > creux[-2]["prix"]
-        controles.append(("Contexte", "Creux de plus en plus hauts", ok,
-                          f"{creux[-2]['prix']:.2f} ({creux[-2]['date']:%m/%Y}) → "
-                          f"{creux[-1]['prix']:.2f} ({creux[-1]['date']:%m/%Y})"))
-    else:
-        controles.append(("Contexte", "Creux de plus en plus hauts", None, "Pas assez de creux avec ce seuil"))
-
-    # --- 2. Zone d'achat ---
-    jambe = derniere_jambe_haussiere(pivots, provisoire)
-    zone = None
-    dans_fibo = False
-    if jambe:
-        a, b = jambe
-        hausse = b["prix"] - a["prix"]
-        zone = {
-            "depart": a, "sommet": b,
-            "haut": b["prix"] - FIBO_HAUT * hausse,
-            "milieu": b["prix"] - FIBO_MILIEU * hausse,
-            "bas": b["prix"] - FIBO_BAS * hausse,
-        }
-        dans_fibo = zone["bas"] <= prix <= zone["haut"]
-        controles.append(("Zone", "Dans le retracement de Fibonacci 38,2–61,8 %", dans_fibo,
-                          f"Zone {zone['bas']:.2f} – {zone['haut']:.2f} "
-                          f"(hausse de {a['prix']:.2f} à {b['prix']:.2f})"))
-    else:
-        controles.append(("Zone", "Dans le retracement de Fibonacci 38,2–61,8 %", None,
-                          "Pas de hausse détectée avec ce seuil"))
-
-    ecart_wma = None
-    pres_wma = False
+    # 1. Position par rapport à la 200 WMA
+    ecart = None
     if pd.notna(wma.iloc[-1]):
-        ecart_wma = (prix / wma.iloc[-1] - 1) * 100
-        pres_wma = abs(ecart_wma) <= 5
-        controles.append(("Zone", "Proche de la 200 WMA (± 5 %)", pres_wma, f"Écart {ecart_wma:+.1f} %"))
+        ecart = (prix / wma.iloc[-1] - 1) * 100
+        points = 2 if -5 <= ecart <= 5 else 1 if -15 <= ecart <= 20 else 0
+        criteres.append({"nom": "Position / 200 WMA", "points": points,
+                         "detail": f"Écart {ecart:+.1f} % (2 pts si entre −5 et +5 %, 1 pt entre −15 et +20 %)"})
     else:
-        controles.append(("Zone", "Proche de la 200 WMA (± 5 %)", None, "Moins de 200 semaines d'historique"))
+        criteres.append({"nom": "Position / 200 WMA", "points": None,
+                         "detail": f"Moins de {PERIODE_WMA} semaines d'historique"})
 
-    en_zone = dans_fibo or pres_wma
-
-    # --- 3. Confirmation du rebond ---
-    au_dessus_mm10 = prix > mm10.iloc[-1]
-    controles.append(("Confirmation", "Clôture au-dessus de la moyenne 10 semaines", au_dessus_mm10,
-                      f"Cours {prix:.2f} / moyenne 10 sem. {mm10.iloc[-1]:.2f}"))
-    rsi_hausse = indice_rsi.iloc[-1] > indice_rsi.iloc[-3]
-    detail_rsi = f"RSI {indice_rsi.iloc[-3]:.0f} il y a 2 semaines → {indice_rsi.iloc[-1]:.0f}"
-    if indice_rsi.iloc[-1] < 30:
-        detail_rsi += " (survendu)"
-    elif indice_rsi.iloc[-1] > 70:
-        detail_rsi += " (suracheté)"
-    controles.append(("Confirmation", "RSI hebdomadaire en hausse", rsi_hausse, detail_rsi))
-    confirme = au_dessus_mm10 and rsi_hausse
-
-    # --- Feu tricolore ---
-    # `etat` est un code court, utilisé par l'écran Opportunités
-    if en_zone and confirme:
-        etat, feu = "zone_rebond", "🟢 Zone + rebond : le rebond est confirmé"
-    elif en_zone:
-        etat, feu = "zone", "🟡 Zone : dans la zone d'achat, attendre la confirmation du rebond"
-    elif zone and prix > zone["haut"]:
-        etat, feu = "au_dessus", "⚪ Au-dessus de la zone : attendre un repli"
-    elif zone and prix > zone["depart"]["prix"]:
-        etat, feu = "sous_zone", "🟠 Sous la zone 61,8 % : rebond fragile, prudence"
+    # 2. Tendance de la 200 WMA (comparée à il y a 20 semaines)
+    wma_hausse = None
+    if wma.notna().sum() > 20:
+        wma_hausse = wma.iloc[-1] > wma.iloc[-21]
+        criteres.append({"nom": "200 WMA en hausse", "points": 2 if wma_hausse else 0,
+                         "detail": f"{wma.iloc[-21]:.2f} il y a 20 semaines → {wma.iloc[-1]:.2f}"})
     else:
-        etat, feu = "sous_creux", "🔴 Sous le creux de départ : la hausse précédente est effacée, prudence"
-    tendance_baissiere = controles[0][2] is False
-    if feu.startswith("🟢") and tendance_baissiere:
-        feu = "🟡 Zone + rebond, mais 200 WMA en baisse : prudence"
+        criteres.append({"nom": "200 WMA en hausse", "points": None, "detail": "Historique trop court"})
 
-    # --- Stop de protection : 3 % sous le creux de départ de la dernière hausse ---
-    if zone and prix > zone["depart"]["prix"] * 0.97:
-        stop = zone["depart"]["prix"] * 0.97
-        origine_stop = f"3 % sous le creux du {zone['depart']['date']:%d/%m/%Y}"
+    # 3. Retracement de Fibonacci de la dernière hausse
+    hausse = derniere_hausse(pivots, provisoire)
+    fibo = None
+    if hausse and hausse[1]["prix"] > hausse[0]["prix"]:
+        a, b = hausse
+        amplitude = b["prix"] - a["prix"]
+        retracement = (b["prix"] - prix) / amplitude  # 0 = au sommet, 1 = revenu au creux
+        fibo = {
+            "depart": a, "sommet": b, "retracement": retracement,
+            "seuil1": b["prix"] - 0.382 * amplitude,
+            "seuil2": b["prix"] - 0.5 * amplitude,
+            "seuil3": b["prix"] - 0.618 * amplitude,
+        }
+        points = 2 if 0.382 <= retracement <= 0.618 else 1 if 0.236 <= retracement <= 0.786 else 0
+        criteres.append({"nom": "Retracement de Fibonacci", "points": points,
+                         "detail": f"Repli de {retracement:.0%} de la hausse {a['prix']:.2f} → {b['prix']:.2f} "
+                                   "(2 pts entre 38,2 et 61,8 %, 1 pt entre 23,6 et 78,6 %)"})
+    else:
+        criteres.append({"nom": "Retracement de Fibonacci", "points": None, "detail": "Pas de hausse détectée"})
+
+    # 4. RSI hebdomadaire : idéalement entre 30 et 50 et en train de remonter
+    r, r_avant = indice_rsi.iloc[-1], indice_rsi.iloc[-3]
+    rsi_monte = r > r_avant
+    if r <= 50 and rsi_monte:
+        points = 2
+    elif r <= 50 or (r <= 60 and rsi_monte):
+        points = 1
+    else:
+        points = 0
+    criteres.append({"nom": "RSI hebdomadaire", "points": points,
+                     "detail": f"RSI {r_avant:.0f} il y a 2 semaines → {r:.0f} "
+                               "(2 pts si ≤ 50 et en hausse ; < 30 = survendu, > 70 = suracheté)"})
+
+    # 5. Rebond : clôture au-dessus de la moyenne 10 semaines
+    rebond = prix > mm10.iloc[-1]
+    criteres.append({"nom": "Rebond (clôture > moyenne 10 sem.)", "points": 2 if rebond else 0,
+                     "detail": f"Cours {prix:.2f} / moyenne 10 semaines {mm10.iloc[-1]:.2f}"})
+
+    # Stop de protection : 3 % sous le creux de départ de la dernière hausse
+    if fibo and prix > fibo["depart"]["prix"] * 0.97:
+        stop = fibo["depart"]["prix"] * 0.97
     else:
         stop = serie.iloc[-10:].min() * 0.97
-        origine_stop = "3 % sous le plus bas des 10 dernières semaines"
 
     return {
-        "prix": prix, "wma": wma, "mm10": mm10, "rsi": indice_rsi,
-        "pivots": pivots, "provisoire": provisoire, "zone": zone,
-        "ecart_wma": ecart_wma, "controles": controles, "feu": feu,
-        "stop": stop, "origine_stop": origine_stop,
-        "etat": etat, "tendance_baissiere": tendance_baissiere,
+        "prix": prix, "wma": wma, "mm10": mm10, "rsi": indice_rsi, "pivots": pivots,
+        "provisoire": provisoire, "fibo": fibo, "ecart": ecart, "stop": stop,
+        "criteres": criteres, "note": note_sur_10(criteres),
     }
 
 
-def nom_societe(ticker):
-    """Nom de la société si on le connaît (listes des indices), sinon le ticker."""
-    if ticker in CAC40:
-        return CAC40[ticker]
-    if ticker in NASDAQ100_SECOURS:
-        return NASDAQ100_SECOURS[ticker]
-    try:
-        return liste_sp500().get(ticker, ticker)
-    except Exception:
-        return ticker
+# =============================================================================
+# 6. NOTE FONDAMENTALE (sur 10)
+# =============================================================================
+# 5 critères à 2 points :
+#   1. Évolution du chiffre d'affaires
+#   2. Rentabilité (ROE)
+#   3. Free cash flow
+#   4. Dette nette / EBITDA
+#   5. PER au cours actuel comparé à son PER moyen des années précédentes
 
 
-def graphique_timing(ticker, serie, t):
-    """Graphique : cours, 200 WMA, moyenne 10 semaines, ZigZag, zone d'achat et stop. 5 dernières années."""
-    debut = serie.index[max(0, len(serie) - 260)]  # environ 5 ans
-    visible = serie[serie.index >= debut]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=visible.index, y=visible.values, name="Cours", line=dict(color="#1f77b4")))
-    fig.add_trace(go.Scatter(x=visible.index, y=t["wma"][visible.index].values, name="200 WMA",
-                             line=dict(color="#ff7f0e")))
-    fig.add_trace(go.Scatter(x=visible.index, y=t["mm10"][visible.index].values, name="Moy. 10 sem.",
-                             line=dict(color="gray", width=1, dash="dot")))
-    points = [p for p in t["pivots"] + ([t["provisoire"]] if t["provisoire"] else []) if p["date"] >= debut]
-    if points:
-        fig.add_trace(go.Scatter(x=[p["date"] for p in points], y=[p["prix"] for p in points],
-                                 name="ZigZag", mode="lines+markers",
-                                 line=dict(color="purple", width=1, dash="dash"), marker=dict(size=5)))
-
-    niveaux = list(visible.values) + [t["stop"]]
-    if t["zone"]:
-        z = t["zone"]
-        fig.add_hrect(y0=z["bas"], y1=z["haut"], fillcolor="green", opacity=0.15, line_width=0,
-                      annotation_text="Zone d'achat", annotation_position="top left")
-        niveaux += [z["bas"], z["haut"]]
-    fig.add_hline(y=t["stop"], line=dict(color="red", dash="dash"),
-                  annotation_text=f"Stop {t['stop']:.2f}", annotation_position="bottom left")
-
-    marge = (max(niveaux) - min(niveaux)) * 0.05
-    fig.update_yaxes(range=[min(niveaux) - marge, max(niveaux) + marge])
-    fig.update_layout(title=f"{ticker} — 5 ans", height=420, margin=dict(l=10, r=10, t=40, b=10),
-                      legend=dict(orientation="h", y=-0.15), hovermode="x unified")
-    st.plotly_chart(fig, width="stretch")
-
-    # Petit graphique du RSI (3 dernières années)
-    rsi_visible = t["rsi"].iloc[-156:]
-    fig_rsi = go.Figure(go.Scatter(x=rsi_visible.index, y=rsi_visible.values, name="RSI",
-                                   line=dict(color="#9467bd")))
-    fig_rsi.add_hline(y=70, line=dict(color="red", dash="dot", width=1))
-    fig_rsi.add_hline(y=30, line=dict(color="green", dash="dot", width=1))
-    fig_rsi.update_layout(title="RSI hebdomadaire (14)", height=200, margin=dict(l=10, r=10, t=40, b=10),
-                          yaxis=dict(range=[0, 100]))
-    st.plotly_chart(fig_rsi, width="stretch")
+def _valeurs(dico):
+    return list(dico.values())
 
 
-def ecran_fiche():
-    st.header(ECRAN_FICHE)
-    st.caption("Timing d'achat (contexte, zone, confirmation) et score qualité d'une action.")
+def analyse_fondamentale(comptes, serie, financiere):
+    criteres = []
+    chiffres = {}  # quelques chiffres clés pour le tableau
 
-    ticker = st.text_input("Ticker", key="fiche_ticker", placeholder="ex. NVDA, MC.PA, AAPL")
-    ticker = ticker.strip().upper()
-    seuil_pct = st.slider("Seuil du ZigZag (%)", 5, 50, 20, key="fiche_seuil",
-                          help="Plus le seuil est petit, plus le ZigZag repère de petits mouvements.")
-    if not ticker:
-        st.info("Tapez un ticker, ou ouvrez une fiche depuis le Scanner.")
-        return
-
-    with st.spinner(f"Chargement de {ticker}…"):
-        serie = serie_cours(ticker)
-    if len(serie) < 30:
-        st.error(f"Pas assez de données pour {ticker}. Vérifiez le ticker (ex. « MC.PA » pour LVMH).")
-        return
-
-    t = analyse_timing(serie, seuil_pct / 100)
-    st.subheader(f"{nom_societe(ticker)} ({ticker})")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Cours", f"{t['prix']:.2f}")
-    c2.metric("200 WMA", f"{t['wma'].iloc[-1]:.2f}" if pd.notna(t["wma"].iloc[-1]) else "—")
-    c3.metric("Écart 200 WMA", f"{t['ecart_wma']:+.1f} %" if t["ecart_wma"] is not None else "—")
-
-    # --- Timing d'achat ---
-    st.markdown("### ⏱️ Timing d'achat")
-    st.markdown(f"#### {t['feu']}")
-    groupe_courant = None
-    for groupe, nom, ok, detail in t["controles"]:
-        if groupe != groupe_courant:
-            st.markdown(f"**{groupe}**")
-            groupe_courant = groupe
-        icone = {True: "✅", False: "❌", None: "➖"}[ok]
-        st.markdown(f"{icone} {nom} — {detail}")
-
-    # Achat en 3 tranches dans la zone de Fibonacci (seulement si le cours n'est pas déjà dessous)
-    if t["zone"] and t["prix"] < t["zone"]["bas"]:
-        st.caption("Le cours est sous la zone de Fibonacci : les tranches d'achat ne s'appliquent pas.")
-    elif t["zone"]:
-        z = t["zone"]
-        st.markdown("**Seuils d'achat : achat en 3 tranches (suggestion)**")
-        tranches = pd.DataFrame([
-            {"Seuil": "Seuil 1 (retracement 38,2 %)", "Prix": z["haut"]},
-            {"Seuil": "Seuil 2 (retracement 50 %)", "Prix": z["milieu"]},
-            {"Seuil": "Seuil 3 (retracement 61,8 %)", "Prix": z["bas"]},
-        ])
-        tranches["Distance au cours"] = (tranches["Prix"] / t["prix"] - 1) * 100
-        st.dataframe(tranches, hide_index=True, width="stretch", column_config={
-            "Prix": st.column_config.NumberColumn(format="%.2f"),
-            "Distance au cours": st.column_config.NumberColumn(format="%+.1f %%"),
-        })
-
-    # Perte si le stop est touché : depuis le prix moyen des 3 tranches si le cours est au-dessus
-    # de la zone (on n'achèterait que dans la zone), sinon depuis le cours actuel
-    z = t["zone"]
-    if z and t["prix"] > z["haut"]:
-        reference = (z["haut"] + z["milieu"] + z["bas"]) / 3
-        texte_ref = f"au prix moyen des 3 tranches ({reference:.2f})"
+    # 1. Chiffre d'affaires : croissance annuelle moyenne (jusqu'à 3 ans) et dernière année
+    ca = _valeurs(comptes["ca"])[-4:]
+    if len(ca) >= 2 and ca[0] > 0:
+        annees = len(ca) - 1
+        moyenne = (ca[-1] / ca[0]) ** (1 / annees) - 1
+        derniere = ca[-1] / ca[-2] - 1
+        chiffres["croissance_ca"] = moyenne * 100
+        points = 2 if moyenne >= CROISSANCE_CA_BONNE and derniere >= 0 else 1 if moyenne > 0 else 0
+        criteres.append({"nom": "Chiffre d'affaires", "points": points,
+                         "detail": f"{moyenne:+.1%} par an sur {annees} an(s), dernière année {derniere:+.1%} "
+                                   f"(2 pts si ≥ {CROISSANCE_CA_BONNE:.0%}/an sans recul, 1 pt si positif)"})
     else:
-        reference = t["prix"]
-        texte_ref = "au cours actuel"
-    perte = (t["stop"] / reference - 1) * 100
-    st.markdown(f"🛑 **Stop de protection suggéré : {t['stop']:.2f}** ({perte:+.1f} % par rapport {texte_ref}) "
-                f"— {t['origine_stop']}.")
+        criteres.append({"nom": "Chiffre d'affaires", "points": None, "detail": "Données absentes"})
 
-    graphique_timing(ticker, serie, t)
+    # 2. Rentabilité : ROE = résultat net / capitaux propres
+    net, cp = _valeurs(comptes["resultat_net"]), _valeurs(comptes["capitaux_propres"])
+    if net and cp:
+        if cp[-1] <= 0:
+            criteres.append({"nom": "Rentabilité (ROE)", "points": 0, "detail": "Capitaux propres négatifs"})
+        else:
+            roe = net[-1] / cp[-1]
+            chiffres["roe"] = roe * 100
+            points = 2 if roe >= ROE_BON else 1 if roe >= ROE_BON / 2 else 0
+            criteres.append({"nom": "Rentabilité (ROE)", "points": points,
+                             "detail": f"ROE {roe:.1%} (2 pts si ≥ {ROE_BON:.0%}, 1 pt si ≥ {ROE_BON / 2:.0%})"})
+    else:
+        criteres.append({"nom": "Rentabilité (ROE)", "points": None, "detail": "Données absentes"})
 
-    # --- Score qualité ---
-    st.markdown("### 🏅 Score qualité")
-    if not st.toggle("Calculer le score qualité", key=f"fiche_qualite_{ticker}"):
-        st.caption("Télécharge les comptes annuels de l'entreprise (quelques secondes).")
-        return
-    comptes, erreurs = comptes_annuels([ticker])
-    if ticker not in comptes:
-        st.warning(f"Comptes indisponibles ({erreurs.get(ticker, 'erreur inconnue')}). Réessayez dans quelques minutes.")
-        if st.button("🔄 Réessayer", key="fiche_reessayer"):
-            st.rerun()
-        return
-    financiere = ticker in FINANCIERES_CAC40 or (
-        not ticker.endswith(".PA") and ticker in financieres_us("S&P 500")
-    )
-    points, evalues, criteres = score_qualite(comptes[ticker], serie, financiere)
-    st.markdown(f"#### {points}/{evalues} → {verdict(points, evalues)}")
-    for c in criteres:
-        icone = {True: "✅", False: "❌", None: "➖"}[c["ok"]]
-        st.markdown(f"{icone} **{c['nom']}** — {c['detail']}")
+    # 3. Free cash flow (argent réellement encaissé) des 2 dernières années
+    fcf = _valeurs(comptes["fcf"])[-2:]
+    if financiere:
+        criteres.append({"nom": "Free cash flow", "points": None, "detail": "Non applicable (banque / assurance)"})
+    elif fcf:
+        positifs = sum(v > 0 for v in fcf)
+        points = 2 if positifs == len(fcf) else 1 if fcf[-1] > 0 else 0
+        texte = ", ".join(f"{v / 1e9:+.2f} Md" for v in fcf)
+        criteres.append({"nom": "Free cash flow", "points": points,
+                         "detail": f"{texte} (2 pts si toujours positif, 1 pt si la dernière année)"})
+    else:
+        criteres.append({"nom": "Free cash flow", "points": None, "detail": "Données absentes"})
+
+    # 4. Dette nette / EBITDA
+    dette, treso, ebitda = _valeurs(comptes["dette"]), _valeurs(comptes["tresorerie"]), _valeurs(comptes["ebitda"])
+    if financiere:
+        criteres.append({"nom": "Dette", "points": None, "detail": "Non applicable (banque / assurance)"})
+    elif dette or treso:
+        dette_nette = (dette[-1] if dette else 0) - (treso[-1] if treso else 0)
+        if dette_nette <= 0:
+            chiffres["dette_ebitda"] = 0.0
+            criteres.append({"nom": "Dette", "points": 2, "detail": "Plus de trésorerie que de dettes"})
+        elif ebitda and ebitda[-1] > 0:
+            ratio = dette_nette / ebitda[-1]
+            chiffres["dette_ebitda"] = ratio
+            points = 2 if ratio < DETTE_EBITDA_BONNE else 1 if ratio < 3 else 0
+            criteres.append({"nom": "Dette", "points": points,
+                             "detail": f"Dette nette / EBITDA = {ratio:.1f} "
+                                       f"(2 pts si < {DETTE_EBITDA_BONNE}, 1 pt si < 3)"})
+        else:
+            criteres.append({"nom": "Dette", "points": 0, "detail": "Endettée avec un EBITDA négatif ou absent"})
+    else:
+        criteres.append({"nom": "Dette", "points": None, "detail": "Données absentes"})
+
+    # 5. PER au cours actuel, comparé au PER moyen des années précédentes
+    #    PER = cours / bénéfice par action (BPA) du dernier exercice publié
+    bpa = pd.Series(comptes["bpa"], dtype=float)
+    historique_per = {}
+    if not bpa.empty:
+        bpa.index = pd.to_datetime(bpa.index)
+        for date, b in bpa.items():
+            prix = serie.asof(date)  # cours à la date de clôture des comptes
+            if b > 0 and pd.notna(prix):
+                historique_per[date] = prix / b
+    if bpa.empty:
+        criteres.append({"nom": "PER", "points": None, "detail": "Données absentes"})
+    elif bpa.iloc[-1] <= 0:
+        criteres.append({"nom": "PER", "points": 0, "detail": "L'entreprise perd de l'argent (BPA négatif)"})
+    else:
+        per = serie.iloc[-1] / bpa.iloc[-1]
+        chiffres["per"] = per
+        passes = [v for d, v in historique_per.items() if d < bpa.index[-1]]
+        if len(passes) >= 2:
+            moyenne = sum(passes) / len(passes)
+            chiffres["per_moyen"] = moyenne
+            points = 2 if per <= moyenne * 0.9 else 1 if per <= moyenne * 1.1 else 0
+            criteres.append({"nom": "PER", "points": points,
+                             "detail": f"PER actuel {per:.1f} contre {moyenne:.1f} en moyenne avant "
+                                       "(2 pts si 10 % moins cher, 1 pt si à peu près égal)"})
+        else:
+            criteres.append({"nom": "PER", "points": None, "detail": f"PER actuel {per:.1f}, historique trop court"})
+
+    return {"criteres": criteres, "note": note_sur_10(criteres), "chiffres": chiffres,
+            "historique_per": historique_per}
 
 
-def ouvrir_fiche(ticker):
-    """Appelé par le bouton du Scanner : bascule vers la fiche de l'action choisie."""
-    st.session_state["ecran"] = ECRAN_FICHE
-    st.session_state["fiche_ticker"] = ticker
-
-
-# ---------------------------------------------------------------------------
-# Écran 4 : Opportunités (analyse technique + fondamentaux)
-# ---------------------------------------------------------------------------
-# Entonnoir :
-#   1. Timing d'achat de toutes les actions de l'indice (rapide : seulement les cours)
-#   2. On garde celles qui sont en « Zone » ou en « Zone + rebond »
-#   3. Score qualité de ces actions-là seulement (lent, donc limité)
-#   4. Décision finale qui combine les deux
-
-ECRAN_OPPORTUNITES = "🎯 Opportunités"
-
-LIBELLES_TIMING = {
-    "zone_rebond": "🟢 Zone + rebond",
-    "zone": "🟡 Zone",
-    "au_dessus": "⚪ Au-dessus",
-    "sous_zone": "🟠 Sous la zone",
-    "sous_creux": "🔴 Sous le creux",
-}
-
-
-def decision(etat, tendance_baissiere, points, evalues):
-    """Combine timing et qualité. Renvoie (libellé, rang pour le tri : plus petit = mieux)."""
-    if evalues is None:
-        return "", 9  # score qualité pas encore calculé
-    if evalues < 3:
-        return "⚪ Données ?", 6
-    ratio = points / evalues
-    if ratio >= 0.8:
-        if etat == "zone_rebond" and not tendance_baissiere:
-            return "🎯 Opportunité", 1
-        return "👀 Surveiller", 2
-    if ratio >= 0.4:
-        return "🟡 Moyenne", 3
-    return "⛔ Prudence", 5
+# =============================================================================
+# 7. TABLEAU DE L'INDICE
+# =============================================================================
 
 
 @st.cache_data(ttl=CACHE_24H, show_spinner="Analyse technique de toutes les actions…")
-def timings_indice(composants, cours, seuil_pct):
-    """Timing d'achat de chaque action de l'indice. Renvoie un tableau (une ligne par action)."""
+def notes_techniques(noms, cours):
+    """Note technique de chaque action de l'indice (rapide : seulement les cours)."""
     lignes = []
-    for ticker, nom in composants.items():
+    for ticker, nom in noms.items():
         if ticker not in cours.columns:
             continue
         serie = cours[ticker].dropna()
-        if len(serie) < 60:  # un peu plus d'un an d'historique au minimum
+        if len(serie) < 60:  # au moins un an d'historique
             continue
-        t = analyse_timing(serie, seuil_pct / 100)
-        z = t["zone"]
+        t = analyse_technique(serie)
+        fibo = t["fibo"]
         lignes.append({
-            "Ticker": ticker,
-            "Nom": nom,
-            "Cours": t["prix"],
-            "Timing": LIBELLES_TIMING[t["etat"]],
-            "200 WMA ↑": "❌" if t["tendance_baissiere"] else "✅",
-            "Seuil 1": z["haut"] if z else None,
-            "Seuil 2": z["milieu"] if z else None,
-            "Seuil 3": z["bas"] if z else None,
+            "Ticker": ticker, "Nom": nom, "Cours": t["prix"],
+            "Note technique": t["note"],
+            "Écart 200 WMA %": t["ecart"],
+            "Repli Fibo %": fibo["retracement"] * 100 if fibo else None,
+            "RSI": t["rsi"].iloc[-1],
+            "Seuil 1": fibo["seuil1"] if fibo else None,
+            "Seuil 2": fibo["seuil2"] if fibo else None,
+            "Seuil 3": fibo["seuil3"] if fibo else None,
             "Stop": t["stop"],
-            "_etat": t["etat"],
-            "_baissiere": t["tendance_baissiere"],
         })
     return pd.DataFrame(lignes)
 
 
-def ecran_opportunites():
-    st.header(ECRAN_OPPORTUNITES)
-    st.caption(
-        "Combine l'analyse technique (le bon moment) et les fondamentaux (la bonne entreprise). "
-        "**Zone** = le cours est dans la zone d'achat. **Zone + rebond** = il y est ET le rebond a commencé. "
-        "**Seuils 1, 2, 3** = prix d'achat des 3 tranches (retracements 38,2 %, 50 %, 61,8 %)."
-    )
+def verdict(note_tech, note_fond):
+    """Résumé en une icône à partir des deux notes."""
+    if pd.isna(note_fond):
+        return ""
+    if note_tech >= 7 and note_fond >= 7:
+        return "🎯 Opportunité"
+    if note_fond >= 7:
+        return "👀 Surveiller"
+    if note_fond < 4:
+        return "⛔ Fragile"
+    return "🟡 Moyenne"
 
-    nom_indice = st.radio("Indice", ["CAC 40", "Nasdaq 100", "S&P 500"], horizontal=True, key="opp_indice")
-    seuil_pct = st.slider("Seuil du ZigZag (%)", 5, 50, 20, key="opp_seuil")
 
-    with st.spinner("Téléchargement des cours…"):
-        composants = composants_indice(nom_indice)
-        cours = cours_hebdo(tuple(sorted(composants)))
+# =============================================================================
+# 8. GRAPHIQUES DE LA FICHE ACTION
+# =============================================================================
+
+
+# Sans la barre d'outils de Plotly, qui cache le titre des graphiques sur iPhone
+SANS_OUTILS = {"displayModeBar": False}
+
+
+def graphique_cours(ticker, serie, t):
+    """Cours, 200 WMA, moyenne 10 semaines, ZigZag, zone d'achat (seuils 1 à 3) et stop, sur 5 ans."""
+    debut = serie.index[max(0, len(serie) - 260)]
+    visible = serie[serie.index >= debut]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=visible.index, y=visible.values, name="Cours", line=dict(color="#1f77b4")))
+    fig.add_trace(go.Scatter(x=visible.index, y=t["wma"][visible.index].values, name="200 WMA",
+                             line=dict(color="#ff7f0e", width=2)))
+    fig.add_trace(go.Scatter(x=visible.index, y=t["mm10"][visible.index].values, name="Moy. 10 sem.",
+                             line=dict(color="gray", width=1, dash="dot")))
+    points = [p for p in t["pivots"] + ([t["provisoire"]] if t["provisoire"] else []) if p["date"] >= debut]
+    if points:
+        fig.add_trace(go.Scatter(x=[p["date"] for p in points], y=[p["prix"] for p in points], name="ZigZag",
+                                 mode="lines+markers", line=dict(color="purple", width=1, dash="dash"),
+                                 marker=dict(size=5)))
+    niveaux = list(visible.values) + [t["stop"]]
+    if t["fibo"]:
+        f = t["fibo"]
+        fig.add_hrect(y0=f["seuil3"], y1=f["seuil1"], fillcolor="green", opacity=0.12, line_width=0)
+        for nom, cle in [("Seuil 1", "seuil1"), ("Seuil 2", "seuil2"), ("Seuil 3", "seuil3")]:
+            fig.add_hline(y=f[cle], line=dict(color="green", width=1, dash="dot"),
+                          annotation_text=f"{nom} {f[cle]:.2f}", annotation_position="top left")
+        niveaux += [f["seuil1"], f["seuil3"]]
+    fig.add_hline(y=t["stop"], line=dict(color="red", dash="dash"),
+                  annotation_text=f"Stop {t['stop']:.2f}", annotation_position="bottom left")
+    marge = (max(niveaux) - min(niveaux)) * 0.05
+    fig.update_yaxes(range=[min(niveaux) - marge, max(niveaux) + marge])
+    fig.update_layout(title=f"{ticker} — 5 ans (hebdomadaire)", height=430, hovermode="x unified",
+                      margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.15))
+    st.plotly_chart(fig, width="stretch", config=SANS_OUTILS)
+
+
+def graphique_rsi(t):
+    visible = t["rsi"].iloc[-156:]  # 3 ans
+    fig = go.Figure(go.Scatter(x=visible.index, y=visible.values, name="RSI", line=dict(color="#9467bd")))
+    fig.add_hline(y=70, line=dict(color="red", dash="dot", width=1), annotation_text="70 suracheté")
+    fig.add_hline(y=30, line=dict(color="green", dash="dot", width=1), annotation_text="30 survendu")
+    fig.update_layout(title="RSI hebdomadaire (14 semaines)", height=220, yaxis=dict(range=[0, 100]),
+                      margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, width="stretch", config=SANS_OUTILS)
+
+
+def graphique_fondamentaux(comptes, historique_per):
+    """Barres : chiffre d'affaires, résultat net et free cash flow par année (en milliards)."""
+    fig = go.Figure()
+    for cle, nom, couleur in [("ca", "Chiffre d'affaires", "#1f77b4"),
+                              ("resultat_net", "Résultat net", "#2ca02c"),
+                              ("fcf", "Free cash flow", "#ff7f0e")]:
+        donnees = comptes.get(cle, {})
+        if donnees:
+            annees = [d[:4] for d in donnees]
+            fig.add_trace(go.Bar(x=annees, y=[v / 1e9 for v in donnees.values()], name=nom,
+                                 marker_color=couleur))
+    fig.update_layout(title="Comptes annuels (milliards)", barmode="group", height=320,
+                      margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
+    st.plotly_chart(fig, width="stretch", config=SANS_OUTILS)
+
+    if historique_per:
+        fig_per = go.Figure(go.Bar(x=[str(d.year) for d in historique_per], y=list(historique_per.values()),
+                                   name="PER", marker_color="#9467bd"))
+        fig_per.update_layout(title="PER à chaque clôture annuelle", height=240,
+                              margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_per, width="stretch", config=SANS_OUTILS)
+
+
+def afficher_criteres(criteres):
+    for c in criteres:
+        if c["points"] is None:
+            icone, score = "➖", "—"
+        else:
+            icone, score = {2: "✅", 1: "🟡", 0: "❌"}[c["points"]], f"{c['points']}/2"
+        st.markdown(f"{icone} **{c['nom']}** ({score}) — {c['detail']}")
+
+
+# =============================================================================
+# 9. FICHE ACTION
+# =============================================================================
+
+
+def fiche_action(ticker, nom, serie, financiere):
+    st.subheader(f"📋 {nom} ({ticker})")
+    t = analyse_technique(serie)
+
+    comptes, erreurs = comptes_annuels([ticker], afficher_progression=False)
+    f = analyse_fondamentale(comptes[ticker], serie, financiere) if ticker in comptes else None
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cours", f"{t['prix']:.2f}")
+    c2.metric("Note technique", f"{t['note']}/10" if t["note"] is not None else "—")
+    c3.metric("Note fondamentale", f"{f['note']}/10" if f and f["note"] is not None else "—")
+
+    onglet_tech, onglet_fond = st.tabs(["📈 Analyse technique", "🏢 Analyse fondamentale"])
+
+    with onglet_tech:
+        afficher_criteres(t["criteres"])
+        if t["fibo"]:
+            fb = t["fibo"]
+            seuils = pd.DataFrame([
+                {"Seuil": "Seuil 1 (repli 38,2 %)", "Prix": fb["seuil1"]},
+                {"Seuil": "Seuil 2 (repli 50 %)", "Prix": fb["seuil2"]},
+                {"Seuil": "Seuil 3 (repli 61,8 %)", "Prix": fb["seuil3"]},
+            ])
+            seuils["Distance au cours"] = (seuils["Prix"] / t["prix"] - 1) * 100
+            st.markdown("**Seuils d'achat (achat en 3 tranches)**")
+            st.dataframe(seuils, hide_index=True, width="stretch", column_config={
+                "Prix": st.column_config.NumberColumn(format="%.2f"),
+                "Distance au cours": st.column_config.NumberColumn(format="%+.1f %%")})
+        st.markdown(f"🛑 **Stop de protection suggéré : {t['stop']:.2f}** "
+                    f"({(t['stop'] / t['prix'] - 1) * 100:+.1f} % par rapport au cours)")
+        graphique_cours(ticker, serie, t)
+        graphique_rsi(t)
+
+    with onglet_fond:
+        if f is None:
+            st.warning(f"Comptes indisponibles ({erreurs.get(ticker, 'erreur inconnue')}). "
+                       "Yahoo limite peut-être les requêtes : réessayez dans quelques minutes.")
+            if st.button("🔄 Réessayer", key="reessayer_fiche"):
+                st.rerun()
+        else:
+            afficher_criteres(f["criteres"])
+            graphique_fondamentaux(comptes[ticker], f["historique_per"])
+            st.caption("Montants dans la devise des comptes de l'entreprise. "
+                       "Le PER est calculé avec le bénéfice par action du dernier exercice publié.")
+
+
+# =============================================================================
+# 10. ÉCRAN PRINCIPAL
+# =============================================================================
+
+
+def main():
+    st.title("🎯 Opportunités")
+    st.caption("Note technique (200 WMA, Fibonacci, RSI, rebond) et note fondamentale "
+               "(chiffre d'affaires, rentabilité, free cash flow, dette, PER), chacune sur 10.")
+
+    nom_indice = st.radio("Indice", ["CAC 40", "Nasdaq 100", "S&P 500"], horizontal=True)
+
+    with st.spinner("Téléchargement des cours (1 à 2 minutes la première fois)…"):
+        noms, financieres = composants_indice(nom_indice)
+        cours = cours_hebdo(tuple(sorted(noms)))
     if cours.empty:
         st.error("Impossible de récupérer les cours. Réessayez plus tard.")
         return
 
-    # --- 1. Timing d'achat de toutes les actions (gardé en cache : calcul long sur le S&P 500) ---
-    tableau = timings_indice(composants, cours, seuil_pct)
+    # --- Note technique de toutes les actions ---
+    tableau = notes_techniques(noms, cours)
     if tableau.empty:
         st.warning("Aucune action analysable.")
         return
 
-    nb_rebond = (tableau["_etat"] == "zone_rebond").sum()
-    nb_zone = (tableau["_etat"] == "zone").sum()
+    # --- Note fondamentale : seulement pour les meilleures notes techniques (Yahoo limite les requêtes) ---
+    tableau = tableau.sort_values("Note technique", ascending=False, na_position="last")
+    nb_max = len(tableau)
+    nb_defaut = min(nb_max, 40)
+    with st.expander("⚙️ Notes fondamentales", expanded=False):
+        st.caption("Les comptes annuels sont téléchargés action par action, ce qui est lent. "
+                   "On commence par les meilleures notes techniques ; augmentez le nombre si besoin "
+                   "(ce qui a déjà été téléchargé est gardé 24 h).")
+        nb = st.slider("Nombre d'actions à analyser", 0, nb_max, nb_defaut, step=5 if nb_max > 50 else 1,
+                       key=f"nb_{nom_indice}")
+    a_analyser = list(tableau["Ticker"].head(nb))
+    comptes, erreurs = comptes_annuels(a_analyser)
+
+    notes_fond, croissances, pers, dettes = [], [], [], []
+    for ticker in tableau["Ticker"]:
+        if ticker in comptes:
+            f = analyse_fondamentale(comptes[ticker], cours[ticker].dropna(), ticker in financieres)
+            ch = f["chiffres"]
+            notes_fond.append(f["note"])
+            croissances.append(ch.get("croissance_ca"))
+            pers.append(ch.get("per"))
+            dettes.append(ch.get("dette_ebitda"))
+        else:
+            notes_fond.append(None)
+            croissances.append(None)
+            pers.append(None)
+            dettes.append(None)
+    tableau["Note fondamentale"] = pd.to_numeric(pd.Series(notes_fond, index=tableau.index), errors="coerce")
+    tableau["Croissance CA %/an"] = pd.to_numeric(pd.Series(croissances, index=tableau.index), errors="coerce")
+    tableau["PER"] = pd.to_numeric(pd.Series(pers, index=tableau.index), errors="coerce")
+    tableau["Dette/EBITDA"] = pd.to_numeric(pd.Series(dettes, index=tableau.index), errors="coerce")
+    tableau["Verdict"] = [verdict(nt, nf) for nt, nf in zip(tableau["Note technique"], tableau["Note fondamentale"])]
+
+    if erreurs:
+        st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : Yahoo limite sans doute les requêtes. "
+                   "Patientez quelques minutes puis appuyez sur « Réessayer ».")
+        if st.button("🔄 Réessayer"):
+            st.rerun()
+
+    # --- Tri : les actions avec les deux notes, de la meilleure moyenne à la moins bonne ---
+    tableau["_moyenne"] = tableau[["Note technique", "Note fondamentale"]].mean(axis=1, skipna=False)
+    tableau = tableau.sort_values(["_moyenne", "Note technique"], ascending=False, na_position="last")
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Analysées", len(tableau))
-    c2.metric("🟢 Zone + rebond", int(nb_rebond))
-    c3.metric("🟡 Zone", int(nb_zone))
+    c1.metric("Actions analysées", len(tableau))
+    c2.metric("🎯 Opportunités", int((tableau["Verdict"] == "🎯 Opportunité").sum()))
+    c3.metric("Notes fondamentales", int(tableau["Note fondamentale"].notna().sum()))
 
-    # --- 2. On garde les actions en zone d'achat ---
-    tout_afficher = st.toggle("Afficher aussi les actions hors zone", key="opp_tout")
-    en_zone = tableau[tableau["_etat"].isin(["zone_rebond", "zone"])]
-    affiche = tableau if tout_afficher else en_zone
+    recherche = st.text_input("🔍 Rechercher (ticker ou nom)", placeholder="ex. NVDA ou LVMH")
+    affiche = tableau
+    if recherche.strip():
+        texte = recherche.strip().lower()
+        affiche = tableau[tableau["Ticker"].str.lower().str.contains(texte, regex=False)
+                          | tableau["Nom"].str.lower().str.contains(texte, regex=False)]
 
-    # --- 3. Score qualité des actions en zone ---
-    qualite_active = not en_zone.empty and st.toggle(
-        f"Calculer le score qualité des {len(en_zone)} actions en zone", key=f"opp_qualite_{nom_indice}"
+    note = lambda titre: st.column_config.NumberColumn(titre, format="%.1f /10")  # chiffre compact (iPhone)
+    prix = st.column_config.NumberColumn(format="%.2f")
+    colonnes = ["Ticker", "Verdict", "Note technique", "Note fondamentale", "Cours",
+                "Écart 200 WMA %", "Repli Fibo %", "RSI", "Croissance CA %/an", "PER", "Dette/EBITDA",
+                "Seuil 1", "Seuil 2", "Seuil 3", "Stop", "Nom"]
+    st.dataframe(
+        affiche[colonnes], hide_index=True, width="stretch", height=420,
+        column_config={
+            "Ticker": st.column_config.TextColumn(pinned=True),
+            "Verdict": st.column_config.TextColumn(width="medium"),
+            "Note technique": note("Note tech."),
+            "Note fondamentale": note("Note fond."),
+            "Cours": prix, "Seuil 1": prix, "Seuil 2": prix, "Seuil 3": prix, "Stop": prix,
+            "Écart 200 WMA %": st.column_config.NumberColumn(format="%+.1f %%"),
+            "Repli Fibo %": st.column_config.NumberColumn(format="%.0f %%"),
+            "RSI": st.column_config.NumberColumn(format="%.0f"),
+            "Croissance CA %/an": st.column_config.NumberColumn(format="%+.1f %%"),
+            "PER": st.column_config.NumberColumn(format="%.1f"),
+            "Dette/EBITDA": st.column_config.NumberColumn(format="%.1f"),
+        },
     )
-    scores = {}
-    if qualite_active:
-        comptes, erreurs = comptes_annuels(list(en_zone["Ticker"]))
-        if erreurs:
-            st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : Yahoo limite sans doute les "
-                       "requêtes. Patientez quelques minutes puis appuyez sur « Réessayer ».")
-            if st.button("🔄 Réessayer", key="opp_reessayer"):
-                st.rerun()
-        for _, ligne in en_zone.iterrows():
-            t = ligne["Ticker"]
-            if t in comptes:
-                points, evalues, _ = score_qualite(comptes[t], cours[t].dropna(), est_financiere(t, nom_indice))
-                scores[t] = (points, evalues)
-    elif not en_zone.empty:
-        st.caption("Activez le score qualité pour obtenir la décision finale (premier calcul : quelques minutes).")
+    st.caption(
+        "🎯 Opportunité : les deux notes ≥ 7 · 👀 Surveiller : bonne note fondamentale (≥ 7), "
+        "mais timing pas encore idéal · 🟡 Moyenne · ⛔ Fragile : note fondamentale < 4. "
+        "Repli Fibo : 0 % = au sommet de la dernière hausse, 100 % = revenu au creux ; "
+        "la zone d'achat va de 38,2 à 61,8 %. Faites glisser le tableau pour voir toutes les colonnes. "
+        f"Dernière semaine de cours : {cours.index[-1]:%d/%m/%Y}."
+    )
 
-    # --- 4. Décision finale ---
-    affiche = affiche.copy()
-    qualites, decisions, rangs = [], [], []
-    for _, ligne in affiche.iterrows():
-        points, evalues = scores.get(ligne["Ticker"], (None, None))
-        libelle, rang = decision(ligne["_etat"], ligne["_baissiere"], points, evalues)
-        qualites.append(f"{points}/{evalues}" if evalues is not None else "")
-        decisions.append(libelle)
-        rangs.append(rang)
-    affiche["Qualité"] = qualites
-    affiche["Décision"] = decisions
-    affiche["_rang"] = rangs
-    ordre_timing = {"zone_rebond": 0, "zone": 1, "au_dessus": 2, "sous_zone": 3, "sous_creux": 4}
-    affiche["_ordre"] = affiche["_etat"].map(ordre_timing)
-    affiche = affiche.sort_values(["_rang", "_ordre", "Ticker"])
-
+    # --- Fiche action ---
+    st.divider()
     if affiche.empty:
-        st.info("Aucune action en zone d'achat pour le moment. Activez « Afficher aussi les actions hors zone ».")
+        st.info("Aucune action ne correspond à la recherche.")
         return
-
-    # Colonnes les plus utiles en premier (l'écran d'un iPhone est étroit)
-    colonnes = ["Ticker", "Décision", "Timing", "Cours", "Seuil 1", "Seuil 2", "Seuil 3",
-                "Stop", "Qualité", "200 WMA ↑", "Nom"]
-    format_prix = st.column_config.NumberColumn(format="%.2f")
-    config = {c: format_prix for c in ["Cours", "Seuil 1", "Seuil 2", "Seuil 3", "Stop"]}
-    config["Ticker"] = st.column_config.TextColumn(pinned=True)  # reste visible pendant le défilement
-    config["Décision"] = st.column_config.TextColumn(width="medium")  # libellé lisible en entier
-    st.dataframe(affiche[colonnes], hide_index=True, width="stretch", column_config=config)
-    st.markdown(
-        "**Décision**  \n"
-        "🎯 **Opportunité** : Zone + rebond, 200 WMA en hausse et qualité ≥ 80 %  \n"
-        "👀 **Surveiller** : bonne qualité (≥ 80 %), mais rebond pas encore confirmé ou 200 WMA en baisse  \n"
-        "🟡 **Moyenne** : qualité entre 40 et 79 %  \n"
-        "⛔ **Prudence** : fondamentaux fragiles (qualité < 40 %)  \n"
-        "⚪ **Données ?** : moins de 3 critères qualité disponibles"
-    )
-    st.caption("Faites glisser le tableau vers la droite pour voir toutes les colonnes.")
-
-    # Ouvrir la fiche détaillée
-    c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
-    choix = c1.selectbox("Voir la fiche de", affiche["Ticker"],
-                         format_func=lambda t: f"{t} — {composants.get(t, t)}", key="opp_choix")
-    c2.button("📋 Ouvrir", on_click=ouvrir_fiche, args=(choix,), width="stretch", key="opp_ouvrir")
+    choix = st.selectbox("Voir la fiche de l'action", affiche["Ticker"],
+                         format_func=lambda t: f"{t} — {noms.get(t, t)}")
+    fiche_action(choix, noms.get(choix, choix), cours[choix].dropna(), choix in financieres)
 
 
-# ---------------------------------------------------------------------------
-# Navigation entre les écrans
-# ---------------------------------------------------------------------------
-# Des boutons en haut de page plutôt qu'une barre latérale : plus pratique sur iPhone.
-ecran = st.radio(
-    "Écran", ["🔎 Scanner", ECRAN_OPPORTUNITES, ECRAN_FICHE, "💼 Portefeuille"],
-    horizontal=True, label_visibility="collapsed", key="ecran",
-)
-
-if ecran == "🔎 Scanner":
-    ecran_scanner()
-elif ecran == "💼 Portefeuille":
-    ecran_portefeuille()
-elif ecran == ECRAN_OPPORTUNITES:
-    ecran_opportunites()
-else:
-    ecran_fiche()
-
-st.caption("⚠️ Outil pédagogique, pas un conseil en investissement. Données : Yahoo Finance.")
+main()
+st.caption("⚠️ Outil d'aide à la réflexion, pas un conseil en investissement. Données : Yahoo Finance.")
