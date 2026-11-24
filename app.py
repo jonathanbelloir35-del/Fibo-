@@ -900,13 +900,14 @@ def main():
 
     note = lambda titre: st.column_config.NumberColumn(titre, format="%.1f /10")  # chiffre compact (iPhone)
     prix = st.column_config.NumberColumn(format="%.2f")
-    colonnes = ["Ticker", "Verdict", "Note technique", "Note fondamentale", "Cours",
+    colonnes = ["Ticker", "Nom", "Verdict", "Note technique", "Note fondamentale", "Cours",
                 "Écart 200 WMA %", "Repli Fibo %", "RSI", "Croissance CA %/an", "PER", "Dette/EBITDA",
-                "Seuil 1", "Seuil 2", "Seuil 3", "Stop", "Nom"]
+                "Seuil 1", "Seuil 2", "Seuil 3", "Stop"]
     st.dataframe(
         affiche[colonnes], hide_index=True, width="stretch", height=420,
         column_config={
-            "Ticker": st.column_config.TextColumn(pinned=True),
+            "Ticker": st.column_config.TextColumn(pinned=True),  # reste visible pendant le défilement
+            "Nom": st.column_config.TextColumn(width="medium"),
             "Verdict": st.column_config.TextColumn(width="medium"),
             "Note technique": note("Note tech."),
             "Note fondamentale": note("Note fond."),
