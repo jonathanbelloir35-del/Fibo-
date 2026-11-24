@@ -1127,16 +1127,23 @@ def rsi_fiable(serie, semaines_ignorees=30):
     return r
 
 
-def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_achat, seuil_vente):
-    """Simulation semaine par semaine. Renvoie (transactions, évolution du portefeuille)."""
+def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_achat, seuil_vente, indice=None):
+    """Simulation semaine par semaine. Renvoie (transactions, évolution du portefeuille).
+
+    Si `indice` est fourni (cours de l'indice), l'argent en attente d'un achat est placé dans
+    l'indice (comme un ETF) : il monte et baisse avec lui, et on le reprend pour chaque achat."""
     prix = cours[tickers].ffill()  # semaine sans cotation : on garde le dernier cours connu
     # RSI calculé sur tout l'historique (pour qu'il soit déjà fiable à la date de départ)
     rsis = pd.DataFrame({t: rsi_fiable(cours[t].dropna()) for t in tickers}).reindex(prix.index)
     dates = prix.index[prix.index >= debut]
     tableau_prix, tableau_rsi = prix.loc[dates].to_numpy(), rsis.loc[dates].to_numpy()
 
+    cours_indice = indice.reindex(dates).ffill().to_numpy() if indice is not None else None
     liquidites, positions, transactions, evolution = capital, {}, [], []
     for i, date in enumerate(dates):
+        # 0. L'argent en attente suit l'indice (si l'option est choisie)
+        if cours_indice is not None and i > 0 and cours_indice[i - 1] > 0 and cours_indice[i] > 0:
+            liquidites *= cours_indice[i] / cours_indice[i - 1]
         # 1. Ventes : actions détenues dont le RSI dépasse le seuil de surachat
         for j in list(positions):
             if tableau_rsi[i, j] > seuil_vente:
@@ -1169,15 +1176,30 @@ def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_ach
     return transactions, pd.DataFrame(evolution).set_index("date")
 
 
-def graphique_evolution(evolution, capital, indice, nom_indice):
-    """Évolution de la valeur du portefeuille, comparée à l'indice et au capital de départ."""
+def reference_equiponderee(cours, tickers, debut, capital):
+    """Référence « honnête » : le capital réparti à parts égales, à la date de départ, entre toutes
+    les actions ACTUELLES de l'indice, puis gardées. Elle a le même biais que le test (seules les
+    entreprises encore dans l'indice aujourd'hui), ce qui permet une comparaison juste."""
+    prix = cours[tickers].ffill().loc[debut:]
+    prix = prix.loc[:, prix.iloc[0].notna()]  # actions déjà cotées à la date de départ
+    if prix.empty:
+        return None
+    return capital * (prix / prix.iloc[0]).mean(axis=1)
+
+
+def graphique_evolution(evolution, capital, indice, nom_indice, reference=None, attente_indice=False):
+    """Évolution de la valeur du portefeuille, comparée à l'indice, à la référence et au capital de départ."""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=evolution.index, y=evolution["Portefeuille"], name="Portefeuille",
                              line=dict(color="#1f77b4", width=3)))
     if indice is not None:
         fig.add_trace(go.Scatter(x=indice.index, y=indice.values, name=f"{nom_indice} (même capital)",
                                  line=dict(color="#ff7f0e", width=2)))
-    fig.add_trace(go.Scatter(x=evolution.index, y=evolution["Liquidités"], name="Dont liquidités",
+    if reference is not None:
+        fig.add_trace(go.Scatter(x=reference.index, y=reference.values, name="Référence équipondérée",
+                                 line=dict(color="#2ca02c", width=2, dash="dash")))
+    nom_attente = "Dont argent en attente (placé dans l'indice)" if attente_indice else "Dont liquidités"
+    fig.add_trace(go.Scatter(x=evolution.index, y=evolution["Liquidités"], name=nom_attente,
                              line=dict(color="gray", width=1, dash="dot")))
     fig.add_hline(y=capital, line=dict(color="black", width=1, dash="dash"),
                   annotation_text=f"Départ {capital:,.0f} €".replace(",", " "))
@@ -1229,12 +1251,18 @@ def page_test_historique():
         mise = c2.number_input("Achat maximum par ligne (€)", 100, 100_000, 1_000, 100, key="bt_mise")
         debut = pd.Timestamp(st.date_input("Date de départ", pd.Timestamp("2023-01-01"), key="bt_debut",
                                            format="DD/MM/YYYY"))
-        seuil_achat = st.slider("Achat si RSI hebdo inférieur à", 15, 50, 30, key="bt_achat")
-        seuil_vente = st.slider("Vente si RSI hebdo supérieur à", 50, 90, 70, key="bt_vente")
+        # Réglages par défaut issus de l'analyse sur 4 périodes × 3 indices (2011-2026) :
+        # acheter un peu plus tôt (35) et revendre plus tard (80) a donné de meilleurs résultats que 30/70.
+        seuil_achat = st.slider("Achat si RSI hebdo inférieur à", 15, 50, 35, key="bt_achat")
+        seuil_vente = st.slider("Vente si RSI hebdo supérieur à", 50, 90, 80, key="bt_vente")
+        attente_indice = st.toggle("Placer l'argent en attente dans l'indice (ETF)", value=True, key="bt_etf",
+                                   help="Au lieu de dormir, l'argent qui attend un signal d'achat suit l'indice. "
+                                        "C'est l'amélioration la plus fiable trouvée par l'analyse.")
         note_min = st.slider("Note fondamentale minimale (si filtre)", 0.0, 10.0, 7.0, 0.5, key="bt_note")
     regle_note = "" if mode == MODE_SANS_NOTE else f" et note fondamentale ≥ {note_min:g}/10"
+    texte_attente = " L'argent en attente est placé dans l'indice." if attente_indice else ""
     st.caption(f"Départ le {debut:%d/%m/%Y} avec {euros(capital)}, {euros(mise)} maximum par achat. "
-               f"Achat si RSI < {seuil_achat}{regle_note} ; vente si RSI > {seuil_vente}.")
+               f"Achat si RSI < {seuil_achat}{regle_note} ; vente si RSI > {seuil_vente}.{texte_attente}")
 
     if not st.toggle("Lancer le test", key=f"bt_lancer_{nom_indice}"):
         return
@@ -1263,16 +1291,25 @@ def page_test_historique():
             if st.button("🔄 Réessayer", key="bt_reessayer"):
                 st.rerun()
 
+    # Cours de l'indice, alignés sur les semaines des actions
+    cours_indice = None
+    if not indice_brut.empty:
+        cours_indice = indice_brut.iloc[:, 0].dropna().reindex(cours.index, method="ffill")
+    if attente_indice and cours_indice is None:
+        st.warning("Cours de l'indice indisponibles : l'argent en attente reste en liquidités.")
+
     filtre = FiltreFondamental(mode, cours, comptes, financieres, note_min)
     transactions, evolution = simuler_portefeuille(cours, tickers, filtre, debut, capital, mise,
-                                                   seuil_achat, seuil_vente)
+                                                   seuil_achat, seuil_vente,
+                                                   indice=cours_indice if attente_indice else None)
 
-    # Indice de comparaison : même capital placé dans l'indice à la date de départ
+    # Comparaisons : même capital placé dans l'indice, et référence équipondérée
     indice = None
-    if not indice_brut.empty:
-        serie_indice = indice_brut.iloc[:, 0].dropna().loc[debut:]
+    if cours_indice is not None:
+        serie_indice = cours_indice.loc[debut:].dropna()
         if not serie_indice.empty:
             indice = capital * serie_indice / serie_indice.iloc[0]
+    reference = reference_equiponderee(cours, tickers, debut, capital)
 
     # --- Résumé ---
     final = evolution["Portefeuille"].iloc[-1]
@@ -1285,11 +1322,31 @@ def page_test_historique():
     c2.metric(f"{nom_indice} (même capital)", euros(indice.iloc[-1]) if indice is not None else "—",
               f"{indice.iloc[-1] / capital - 1:+.1%}" if indice is not None else None)
     c3, c4 = st.columns(2)
-    c3.metric("Gain / perte", euros(gain))
+    c3.metric("Référence équipondérée", euros(reference.iloc[-1]) if reference is not None else "—",
+              f"{reference.iloc[-1] / capital - 1:+.1%}" if reference is not None else None,
+              help="Toutes les actions actuelles de l'indice achetées à parts égales au départ, puis gardées")
     c4.metric("Pire baisse en cours de route", f"{pire_baisse:.1f} %",
               help="Plus forte chute de la valeur du portefeuille depuis un sommet")
 
-    graphique_evolution(evolution, capital, indice, nom_indice)
+    if reference is not None:
+        ecart = final - reference.iloc[-1]
+        if ecart >= 0:
+            st.success(f"✅ La stratégie fait mieux que la référence équipondérée de {euros(ecart)}.")
+        else:
+            st.warning(f"⚠️ La stratégie fait moins bien que la référence équipondérée de {euros(-ecart)} : "
+                       "acheter simplement toutes les actions de l'indice aurait rapporté plus.")
+
+    graphique_evolution(evolution, capital, indice, nom_indice, reference, attente_indice)
+    with st.expander("ℹ️ Comment lire ces comparaisons"):
+        st.markdown(
+            "- **Biais du survivant** : le test utilise la liste ACTUELLE des actions de l'indice. "
+            "Les entreprises qui ont chuté au point de sortir de l'indice (ou fait faillite) n'y sont pas. "
+            "Les résultats sont donc trop flatteurs, surtout quand on garde longtemps les actions.\n"
+            "- **Référence équipondérée** (vert) : elle a exactement le même biais. C'est donc la "
+            "comparaison la plus juste : si la stratégie ne la bat pas, sa méthode n'apporte rien de plus "
+            "que de détenir toutes les actions de l'indice.\n"
+            "- **Indice** (orange) : ce que vous auriez réellement eu avec un ETF (hors dividendes)."
+        )
     st.caption("L'indice est sans les dividendes, alors que les actions du portefeuille les incluent. "
                "Les montants des actions américaines sont en dollars, comptés comme des euros. "
                "Frais de courtage et impôts non compris.")
