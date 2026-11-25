@@ -824,12 +824,136 @@ def fiche_action(ticker, nom, serie, financiere):
 # =============================================================================
 
 
+# --- Filtres de valorisation (croissance du CA, PER actuel / PER moyen) ---------------------------
+# D'où viennent les données :
+#   - Chiffre d'affaires et bénéfice par action (BPA) : comptes annuels publiés, fournis par Yahoo Finance
+#     (compte de résultat annuel). Yahoo ne donne qu'environ 4 exercices.
+#   - Cours : cours hebdomadaires Yahoo Finance (ajustés des divisions d'actions et dividendes).
+#   - PER d'une année = cours à la date de clôture de l'exercice / BPA de cet exercice.
+#   - PER actuel = dernier cours / BPA du dernier exercice publié.
+
+PER_MAX_AUTORISE = 100  # au-delà, le PER n'a plus beaucoup de sens (bénéfice quasi nul)
+PER_MIN_PLAUSIBLE = 3   # en dessous, presque toujours une erreur : comptes publiés dans une autre devise que
+                        # le cours (ex. PDD : yuans contre dollars) ou BPA erroné chez Yahoo (ex. Trade Desk)
+PERIODE_1AN, PERIODE_3ANS = "1 an", "Moyenne 3 ans"
+
+# Réglages mémorisés dans l'adresse de la page : clé du widget -> (nom dans l'URL, type, valeur par défaut)
+REGLAGES = {
+    "opp_indice": ("indice", str, "CAC 40"),
+    "f_ca_min": ("ca_min", int, 5),
+    "f_ca_periode": ("ca_periode", str, PERIODE_1AN),
+    "f_per_max": ("per_max", float, 0.9),
+}
+VALEURS_AUTORISEES = {"opp_indice": ["CAC 40", "Nasdaq 100", "S&P 500"],
+                      "f_ca_periode": [PERIODE_1AN, PERIODE_3ANS]}
+
+
+def charger_reglages():
+    """Au premier affichage, reprend les derniers réglages enregistrés dans l'adresse de la page."""
+    for cle, (param, typ, defaut) in REGLAGES.items():
+        if cle in st.session_state:
+            continue
+        valeur = defaut
+        try:
+            if param in st.query_params:
+                valeur = typ(st.query_params[param])
+        except ValueError:
+            valeur = defaut
+        if cle in VALEURS_AUTORISEES and valeur not in VALEURS_AUTORISEES[cle]:
+            valeur = defaut
+        if cle == "f_ca_min":
+            valeur = min(30, max(-10, valeur))
+        if cle == "f_per_max":
+            valeur = min(1.5, max(0.5, round(valeur * 20) / 20))  # pas de 0,05
+        st.session_state[cle] = valeur
+
+
+def sauver_reglages():
+    """Enregistre les réglages actuels dans l'adresse de la page (retrouvés au prochain chargement)."""
+    for cle, (param, _, _) in REGLAGES.items():
+        if cle in st.session_state:
+            st.query_params[param] = str(st.session_state[cle])
+
+
+def valorisation(comptes, serie):
+    """Croissance du CA et PER (actuel, moyen sur 5 ans au plus) d'une action.
+
+    Renvoie un dict avec les valeurs (None si impossible) et la liste des données manquantes."""
+    r = {"ca_1an": None, "ca_3ans": None, "per": None, "per_moyen": None, "annees_per": 0,
+         "ratio": None, "probleme": None, "manques": []}
+    ca = list(comptes.get("ca", {}).values())
+    if len(ca) >= 2 and ca[-2] > 0:
+        r["ca_1an"] = (ca[-1] / ca[-2] - 1) * 100
+    else:
+        r["manques"].append("CA : moins de 2 années")
+    if len(ca) >= 4 and ca[-4] > 0:
+        r["ca_3ans"] = ((ca[-1] / ca[-4]) ** (1 / 3) - 1) * 100
+    elif len(ca) >= 2:
+        r["manques"].append(f"CA : {len(ca)} années seulement, moyenne 3 ans impossible")
+
+    bpa = pd.Series(comptes.get("bpa", {}), dtype=float)
+    if bpa.empty:
+        r["probleme"] = "BPA (bénéfice par action) absent chez Yahoo"
+        return r
+    bpa.index = pd.to_datetime(bpa.index)
+    bpa = bpa.sort_index()
+    if bpa.iloc[-1] <= 0:
+        r["probleme"] = "PER négatif (l'entreprise perd de l'argent)"
+        return r
+    r["per"] = serie.iloc[-1] / bpa.iloc[-1]
+    if r["per"] < PER_MIN_PLAUSIBLE:
+        r["probleme"] = (f"PER anormalement bas ({r['per']:.1f}) : comptes dans une autre devise que le cours, "
+                         "ou erreur de données chez Yahoo")
+        return r
+    if r["per"] > PER_MAX_AUTORISE:
+        r["probleme"] = f"PER supérieur à {PER_MAX_AUTORISE} ({r['per']:.0f})"
+        return r
+
+    # PER à chaque clôture annuelle des 5 dernières années (années bénéficiaires, PER ≤ 100)
+    historiques = []
+    for date, b in bpa.iloc[-5:].items():
+        prix = serie.asof(date)
+        if b > 0 and pd.notna(prix) and prix / b <= PER_MAX_AUTORISE:
+            historiques.append(prix / b)
+    r["annees_per"] = len(historiques)
+    if len(historiques) < 2:
+        r["probleme"] = f"PER historique insuffisant ({len(historiques)} année utilisable)"
+        return r
+    if len(historiques) < 4:  # Yahoo fournit au mieux 4 exercices : on ne signale que les cas plus courts
+        r["manques"].append(f"PER moyen sur {len(historiques)} ans seulement (années en perte ou PER > 100 écartées)")
+    r["per_moyen"] = sum(historiques) / len(historiques)
+    r["ratio"] = r["per"] / r["per_moyen"]
+    return r
+
+
 def main():
     st.title("🎯 Opportunités")
-    st.caption("Note technique (200 WMA, Fibonacci, RSI, rebond) et note fondamentale "
-               "(chiffre d'affaires, rentabilité, free cash flow, dette, PER), chacune sur 10.")
+    st.caption("Filtrez les actions sur leur croissance et leur prix (PER), puis consultez leurs notes "
+               "technique et fondamentale.")
+    charger_reglages()
 
-    nom_indice = st.radio("Indice", ["CAC 40", "Nasdaq 100", "S&P 500"], horizontal=True)
+    nom_indice = st.radio("Indice", VALEURS_AUTORISEES["opp_indice"], horizontal=True, key="opp_indice")
+
+    # --- Zone de filtres ---
+    with st.container(border=True):
+        st.markdown("**🎛️ Filtres**")
+        c1, c2 = st.columns([2, 1], vertical_alignment="bottom")
+        ca_min = c1.slider("Croissance du CA minimum (%)", -10, 30, step=1, key="f_ca_min", format="%+d %%")
+        periode = c2.selectbox("Période", [PERIODE_1AN, PERIODE_3ANS], key="f_ca_periode")
+        per_max = st.slider("Ratio PER actuel / PER moyen 5 ans maximum", 0.5, 1.5, step=0.05,
+                            key="f_per_max", format="%.2f")
+        ecart = abs(per_max - 1) * 100
+        if per_max < 1:
+            st.caption(f"Ratio {per_max:.2f} = PER actuel {ecart:.0f} % sous sa moyenne : "
+                       f"**moins cher que d'habitude**".replace(".", ","))
+        elif per_max > 1:
+            st.caption(f"Ratio {per_max:.2f} = PER actuel {ecart:.0f} % au-dessus de sa moyenne : "
+                       f"**plus cher que d'habitude**".replace(".", ","))
+        else:
+            st.caption("Ratio 1,00 = PER actuel égal à sa moyenne : au même prix que d'habitude")
+        st.caption("PER moyen calculé sur les clôtures annuelles disponibles, 4 ans au plus "
+                   "(Yahoo Finance ne fournit pas 5 ans de comptes).")
+    sauver_reglages()
 
     with st.spinner("Téléchargement des cours (1 à 2 minutes la première fois)…"):
         noms, financieres = composants_indice(nom_indice)
@@ -844,71 +968,78 @@ def main():
         st.warning("Aucune action analysable.")
         return
 
-    # --- Note fondamentale : seulement pour les meilleures notes techniques (Yahoo limite les requêtes) ---
-    tableau = tableau.sort_values("Note technique", ascending=False, na_position="last")
-    nb_max = len(tableau)
-    nb_defaut = min(nb_max, 40)
-    with st.expander("⚙️ Notes fondamentales", expanded=False):
-        st.caption("Les comptes annuels sont téléchargés action par action, ce qui est lent. "
-                   "On commence par les meilleures notes techniques ; augmentez le nombre si besoin "
-                   "(ce qui a déjà été téléchargé est gardé 24 h).")
-        nb = st.slider("Nombre d'actions à analyser", 0, nb_max, nb_defaut, step=5 if nb_max > 50 else 1,
-                       key=f"nb_{nom_indice}")
-    a_analyser = list(tableau["Ticker"].head(nb))
-    comptes, erreurs = comptes_annuels(a_analyser)
-
-    notes_fond, croissances, pers, dettes = [], [], [], []
-    for ticker in tableau["Ticker"]:
-        if ticker in comptes:
-            f = analyse_fondamentale(comptes[ticker], cours[ticker].dropna(), ticker in financieres)
-            ch = f["chiffres"]
-            notes_fond.append(f["note"])
-            croissances.append(ch.get("croissance_ca"))
-            pers.append(ch.get("per"))
-            dettes.append(ch.get("dette_ebitda"))
-        else:
-            notes_fond.append(None)
-            croissances.append(None)
-            pers.append(None)
-            dettes.append(None)
-    tableau["Note fondamentale"] = pd.to_numeric(pd.Series(notes_fond, index=tableau.index), errors="coerce")
-    tableau["Croissance CA %/an"] = pd.to_numeric(pd.Series(croissances, index=tableau.index), errors="coerce")
-    tableau["PER"] = pd.to_numeric(pd.Series(pers, index=tableau.index), errors="coerce")
-    tableau["Dette/EBITDA"] = pd.to_numeric(pd.Series(dettes, index=tableau.index), errors="coerce")
-    tableau["Verdict"] = [verdict(nt, nf) for nt, nf in zip(tableau["Note technique"], tableau["Note fondamentale"])]
-
+    # --- Comptes annuels de TOUTES les actions de l'indice (nécessaires pour filtrer) ---
+    comptes, erreurs = comptes_annuels(list(tableau["Ticker"]))
     if erreurs:
         st.warning(f"Comptes indisponibles pour {len(erreurs)} action(s) : Yahoo limite sans doute les requêtes. "
                    "Patientez quelques minutes puis appuyez sur « Réessayer ».")
         if st.button("🔄 Réessayer"):
             st.rerun()
 
-    # --- Tri : les actions avec les deux notes, de la meilleure moyenne à la moins bonne ---
-    tableau["_moyenne"] = tableau[["Note technique", "Note fondamentale"]].mean(axis=1, skipna=False)
-    tableau = tableau.sort_values(["_moyenne", "Note technique"], ascending=False, na_position="last")
+    # --- Valorisation, note fondamentale et application des filtres ---
+    lignes, exclues, incompletes = [], [], []
+    for _, ligne in tableau.iterrows():
+        t = ligne["Ticker"]
+        if t not in comptes:
+            exclues.append({"Ticker": t, "Nom": ligne["Nom"], "Problème": "Comptes indisponibles (Yahoo)"})
+            continue
+        serie = cours[t].dropna()
+        v = valorisation(comptes[t], serie)
+        croissance = v["ca_1an"] if periode == PERIODE_1AN else v["ca_3ans"]
+        probleme = v["probleme"]
+        if probleme is None and croissance is None:
+            probleme = "CA manquant pour la période choisie"
+        if probleme:
+            exclues.append({"Ticker": t, "Nom": ligne["Nom"], "Problème": probleme})
+            continue
+        if v["manques"]:
+            incompletes.append({"Ticker": t, "Nom": ligne["Nom"], "Donnée manquante": " ; ".join(v["manques"])})
+        if croissance < ca_min or v["ratio"] > per_max + 1e-9:
+            continue  # ne passe pas les filtres
+        f = analyse_fondamentale(comptes[t], serie, t in financieres)
+        lignes.append({**ligne.to_dict(), "Croissance CA %": croissance, "PER actuel": v["per"],
+                       "PER moyen": v["per_moyen"], "Ratio PER": v["ratio"], "Années PER": v["annees_per"],
+                       "Note fondamentale": f["note"], "Dette/EBITDA": f["chiffres"].get("dette_ebitda"),
+                       "Verdict": verdict(ligne["Note technique"], f["note"] if f["note"] is not None else np.nan)})
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Actions analysées", len(tableau))
-    c2.metric("🎯 Opportunités", int((tableau["Verdict"] == "🎯 Opportunité").sum()))
-    c3.metric("Notes fondamentales", int(tableau["Note fondamentale"].notna().sum()))
+    c1.metric("Actions retenues", len(lignes), help="Actions qui passent les deux filtres")
+    c2.metric("Actions analysées", len(tableau))
+    c3.metric("⚠️ Exclues (données / PER)", len(exclues),
+              help="PER négatif ou supérieur à 100, ou donnée manquante : voir le détail plus bas")
 
+    if not lignes:
+        st.info("Aucune action ne passe les filtres. Assouplissez-les (croissance plus basse, ratio plus haut).")
+        afficher_donnees_manquantes(exclues, incompletes)
+        return
+
+    # --- Tri par ratio PER croissant (les moins chères par rapport à leur habitude d'abord) ---
+    resultat = pd.DataFrame(lignes).sort_values("Ratio PER")
     recherche = st.text_input("🔍 Rechercher (ticker ou nom)", placeholder="ex. NVDA ou LVMH")
-    affiche = tableau
+    affiche = resultat
     if recherche.strip():
         texte = recherche.strip().lower()
-        affiche = tableau[tableau["Ticker"].str.lower().str.contains(texte, regex=False)
-                          | tableau["Nom"].str.lower().str.contains(texte, regex=False)]
+        affiche = resultat[resultat["Ticker"].str.lower().str.contains(texte, regex=False)
+                           | resultat["Nom"].str.lower().str.contains(texte, regex=False)]
 
     note = lambda titre: st.column_config.NumberColumn(titre, format="%.1f /10")  # chiffre compact (iPhone)
     prix = st.column_config.NumberColumn(format="%.2f")
-    colonnes = ["Ticker", "Nom", "Verdict", "Note technique", "Note fondamentale", "Cours",
-                "Écart 200 WMA %", "Repli Fibo %", "RSI", "Croissance CA %/an", "PER", "Dette/EBITDA",
-                "Seuil 1", "Seuil 2", "Seuil 3", "Stop"]
+    colonnes = ["Ticker", "Nom", "Croissance CA %", "PER actuel", "PER moyen", "Ratio PER", "Années PER",
+                "Verdict", "Note technique", "Note fondamentale", "Cours", "Écart 200 WMA %", "Repli Fibo %",
+                "RSI", "Dette/EBITDA", "Seuil 1", "Seuil 2", "Seuil 3", "Stop"]
     st.dataframe(
-        affiche[colonnes], hide_index=True, width="stretch", height=420,
+        affiche[colonnes], hide_index=True, width="stretch",
+        height=min(420, 35 * (len(affiche) + 1) + 3),  # hauteur adaptée au nombre d'actions
         column_config={
             "Ticker": st.column_config.TextColumn(pinned=True),  # reste visible pendant le défilement
             "Nom": st.column_config.TextColumn(width="medium"),
+            "Croissance CA %": st.column_config.NumberColumn(
+                f"Croissance CA ({'1 an' if periode == PERIODE_1AN else 'moy. 3 ans'})", format="%+.1f %%"),
+            "PER actuel": st.column_config.NumberColumn(format="%.1f"),
+            "PER moyen": st.column_config.NumberColumn("PER moyen 5 ans", format="%.1f",
+                                                       help="Moyenne des PER aux clôtures annuelles disponibles"),
+            "Ratio PER": st.column_config.NumberColumn(format="%.2f", help="< 1 : moins cher que d'habitude"),
+            "Années PER": st.column_config.NumberColumn(format="%d", help="Nombre d'années dans le PER moyen"),
             "Verdict": st.column_config.TextColumn(width="medium"),
             "Note technique": note("Note tech."),
             "Note fondamentale": note("Note fond."),
@@ -916,18 +1047,16 @@ def main():
             "Écart 200 WMA %": st.column_config.NumberColumn(format="%+.1f %%"),
             "Repli Fibo %": st.column_config.NumberColumn(format="%.0f %%"),
             "RSI": st.column_config.NumberColumn(format="%.0f"),
-            "Croissance CA %/an": st.column_config.NumberColumn(format="%+.1f %%"),
-            "PER": st.column_config.NumberColumn(format="%.1f"),
             "Dette/EBITDA": st.column_config.NumberColumn(format="%.1f"),
         },
     )
     st.caption(
-        "🎯 Opportunité : les deux notes ≥ 7 · 👀 Surveiller : bonne note fondamentale (≥ 7), "
-        "mais timing pas encore idéal · 🟡 Moyenne · ⛔ Fragile : note fondamentale < 4. "
-        "Repli Fibo : 0 % = au sommet de la dernière hausse, 100 % = revenu au creux ; "
-        "la zone d'achat va de 38,2 à 61,8 %. Faites glisser le tableau pour voir toutes les colonnes. "
-        f"Dernière semaine de cours : {cours.index[-1]:%d/%m/%Y}."
+        "Trié du ratio PER le plus bas (le moins cher par rapport à son habitude) au plus haut. "
+        "« Années PER » : nombre de clôtures annuelles utilisées pour le PER moyen (Yahoo en fournit 4 au plus). "
+        "🎯 Opportunité : notes technique et fondamentale ≥ 7 · 👀 Surveiller · 🟡 Moyenne · ⛔ Fragile. "
+        f"Faites glisser le tableau pour voir toutes les colonnes. Dernière semaine de cours : {cours.index[-1]:%d/%m/%Y}."
     )
+    afficher_donnees_manquantes(exclues, incompletes)
 
     # --- Fiche action ---
     st.divider()
@@ -937,6 +1066,20 @@ def main():
     choix = st.selectbox("Voir la fiche de l'action", affiche["Ticker"],
                          format_func=lambda t: f"{t} — {noms.get(t, t)}")
     fiche_action(choix, noms.get(choix, choix), cours[choix].dropna(), choix in financieres)
+
+
+def afficher_donnees_manquantes(exclues, incompletes):
+    """Prévient des données manquantes : actions exclues, et actions affichées avec des données partielles."""
+    if exclues:
+        with st.expander(f"⚠️ Actions exclues ({len(exclues)}) : PER négatif, supérieur à {PER_MAX_AUTORISE} "
+                         "ou anormal, ou donnée manquante"):
+            st.dataframe(pd.DataFrame(exclues), hide_index=True, width="stretch",
+                         column_config={"Problème": st.column_config.TextColumn(width="large")})
+    if incompletes:
+        with st.expander(f"ℹ️ Données partielles ({len(incompletes)} action(s))"):
+            st.caption("Ces actions restent analysées, mais avec moins d'historique que les autres.")
+            st.dataframe(pd.DataFrame(incompletes), hide_index=True, width="stretch",
+                         column_config={"Donnée manquante": st.column_config.TextColumn(width="large")})
 
 
 # =============================================================================
