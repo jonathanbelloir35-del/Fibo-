@@ -1232,9 +1232,12 @@ def comptes_a_la_date(comptes, date):
 class FiltreFondamental:
     """Dit si une action peut être achetée à une date donnée, selon le mode choisi."""
 
-    def __init__(self, mode, cours, comptes, financieres, note_min):
+    def __init__(self, mode, cours, comptes, financieres, note_min, valo=None):
+        """valo : None, ou dict des filtres de valorisation (comme l'écran Opportunités) :
+        {"ca_min": 5, "periode": PERIODE_1AN, "per_max": 0.9, "epoque": True}
+        epoque=True : seuls les comptes publiés avant la date d'achat sont utilisés (honnête)."""
         self.mode, self.cours, self.comptes = mode, cours, comptes
-        self.financieres, self.note_min = financieres, note_min
+        self.financieres, self.note_min, self.valo = financieres, note_min, valo
         self.memo = {}  # la note ne change qu'à chaque publication de comptes : on la mémorise
 
     def note(self, ticker, date):
@@ -1256,11 +1259,41 @@ class FiltreFondamental:
                                                   ticker in self.financieres)["note"]
         return self.memo[cle]
 
+    def valeurs(self, ticker, date):
+        """Croissance du CA et ratio PER de l'action à la date donnée (None si indisponibles)."""
+        if not self.valo or ticker not in self.comptes:
+            return None
+        serie = self.cours[ticker].dropna().loc[:date]  # cours connus à la date (le PER dépend du cours du jour)
+        if self.valo["epoque"]:
+            comptes = comptes_a_la_date(self.comptes[ticker], date)
+        else:
+            comptes = self.comptes[ticker]
+        return valorisation(comptes, serie)
+
+    def infos(self, ticker, date):
+        """Valeurs enregistrées avec chaque achat (affichées dans le tableau des transactions)."""
+        infos = {"note": self.note(ticker, date)}
+        v = self.valeurs(ticker, date)
+        if v is not None:
+            infos["ca_achat"] = v["ca_1an"] if self.valo["periode"] == PERIODE_1AN else v["ca_3ans"]
+            infos["ratio_achat"] = v["ratio"]
+        return infos
+
     def autorise(self, ticker, date):
-        if self.mode == MODE_SANS_NOTE:
-            return True
-        n = self.note(ticker, date)
-        return n is not None and n >= self.note_min
+        # 1. Note fondamentale (si ce filtre est choisi)
+        if self.mode != MODE_SANS_NOTE:
+            n = self.note(ticker, date)
+            if n is None or n < self.note_min:
+                return False
+        # 2. Croissance du CA et ratio PER (si ces filtres sont activés)
+        if self.valo:
+            v = self.valeurs(ticker, date)
+            if v is None or v["probleme"] or v["ratio"] is None:
+                return False  # données manquantes, PER négatif, > 100 ou anormal : pas d'achat
+            croissance = v["ca_1an"] if self.valo["periode"] == PERIODE_1AN else v["ca_3ans"]
+            if croissance is None or croissance < self.valo["ca_min"] or v["ratio"] > self.valo["per_max"] + 1e-9:
+                return False
+        return True
 
 
 def rsi_fiable(serie, semaines_ignorees=30):
@@ -1309,7 +1342,7 @@ def simuler_portefeuille(cours, tickers, filtre, debut, capital, mise, seuil_ach
             liquidites -= montant
             positions[j] = {"Ticker": tickers[j], "date": date, "prix": tableau_prix[i, j], "rsi": r,
                             "parts": montant / tableau_prix[i, j], "montant": montant,
-                            "note": filtre.note(tickers[j], date)}
+                            **filtre.infos(tickers[j], date)}
         # 3. Valeur du portefeuille cette semaine
         investi = sum(p["parts"] * tableau_prix[i, j] for j, p in positions.items())
         evolution.append({"date": date, "Portefeuille": liquidites + investi, "Liquidités": liquidites})
@@ -1434,7 +1467,7 @@ def simuler_portefeuille_fibo(cours, tickers, filtre, debut, capital, mise, zone
             liquidites -= montant
             a, b = A[i, j], B[i, j]
             positions[j] = {"Ticker": tickers[j], "date": date, "prix": P[i, j], "rsi": r, "repli": repli * 100,
-                            "parts": montant / P[i, j], "montant": montant, "note": filtre.note(tickers[j], date),
+                            "parts": montant / P[i, j], "montant": montant, **filtre.infos(tickers[j], date),
                             "stop": b - invalidation * (b - a), "objectif": a + extension * (b - a)}
         investi = sum(p["parts"] * (P[i, j] if not np.isnan(P[i, j]) else p["prix"]) for j, p in positions.items())
         evolution.append({"date": date, "Portefeuille": liquidites + investi, "Liquidités": liquidites})
@@ -1560,7 +1593,41 @@ def page_test_historique():
                                    help="Au lieu de dormir, l'argent qui attend un signal d'achat suit l'indice. "
                                         "C'est l'amélioration la plus fiable trouvée par l'analyse.")
         note_min = st.slider("Note fondamentale minimale (si filtre)", 0.0, 10.0, 7.0, 0.5, key="bt_note")
+
+    # Filtres de valorisation, comme l'écran Opportunités (valeurs par défaut = derniers réglages de cet écran)
+    with st.expander("🎛️ Filtres croissance du CA / PER (comme Opportunités)", expanded=False):
+        valo_actif = st.toggle("Activer ces filtres à l'achat", value=False, key="bt_valo")
+        def defaut(param, typ, valeur):
+            try:
+                return typ(st.query_params.get(param, valeur))
+            except ValueError:
+                return valeur
+        c1, c2 = st.columns([2, 1], vertical_alignment="bottom")
+        bt_ca_min = c1.slider("Croissance du CA minimum (%)", -10, 30,
+                              min(30, max(-10, defaut("ca_min", int, 5))), step=1, key="bt_ca_min", format="%+d %%")
+        periodes = [PERIODE_1AN, PERIODE_3ANS]
+        p0 = defaut("ca_periode", str, PERIODE_1AN)
+        bt_periode = c2.selectbox("Période", periodes, index=periodes.index(p0) if p0 in periodes else 0,
+                                  key="bt_ca_periode")
+        bt_per_max = st.slider("Ratio PER actuel / PER moyen maximum", 0.5, 1.5,
+                               min(1.5, max(0.5, round(defaut("per_max", float, 0.9) * 20) / 20)), step=0.05,
+                               key="bt_per_max", format="%.2f")
+        st.caption("< 1 : moins cher que d'habitude · > 1 : plus cher que d'habitude. "
+                   "Les PER négatifs, supérieurs à 100 ou anormaux (< 3) sont exclus.")
+        valo_epoque = st.radio("Comptes utilisés", ["Ceux publiés avant l'achat (honnête)",
+                                                    "Ceux d'aujourd'hui (trop optimiste)"],
+                               key="bt_valo_mode").startswith("Ceux publiés")
+        st.caption("⚠️ Yahoo ne fournit que 4 exercices de comptes (2022 à 2025 en général). Avec les comptes "
+                   "publiés avant l'achat, ces filtres ne deviennent utilisables qu'à partir d'avril 2024 environ "
+                   "(croissance sur 1 an et ratio PER), et d'avril 2026 pour la moyenne sur 3 ans : "
+                   "avant, aucune action ne peut être achetée.")
+    valo = ({"ca_min": bt_ca_min, "periode": bt_periode, "per_max": bt_per_max, "epoque": valo_epoque}
+            if valo_actif else None)
+
     regle_note = "" if mode == MODE_SANS_NOTE else f" et note fondamentale ≥ {note_min:g}/10"
+    if valo:
+        regle_note += (f", croissance du CA ({bt_periode.lower()}) ≥ {bt_ca_min:+d} % et ratio PER ≤ "
+                       f"{bt_per_max:.2f}".replace(".", ","))
     texte_attente = " L'argent en attente est placé dans l'indice." if attente_indice else ""
     if strategie == STRAT_RSI:
         texte_regles = f"Achat si RSI < {seuil_achat}{regle_note} ; vente si RSI > {seuil_vente}."
@@ -1592,7 +1659,7 @@ def page_test_historique():
     # Comptes annuels : seulement si un filtre fondamental est utilisé (et seulement pour
     # les actions qui ont été au moins une fois en survente depuis la date de départ)
     comptes = {}
-    if mode != MODE_SANS_NOTE:
+    if mode != MODE_SANS_NOTE or valo:
         if strategie == STRAT_RSI:
             candidats = [t for t in tickers if (rsi_fiable(cours[t].dropna()).loc[debut:] < seuil_achat).any()]
         else:
@@ -1611,7 +1678,7 @@ def page_test_historique():
     if attente_indice and cours_indice is None:
         st.warning("Cours de l'indice indisponibles : l'argent en attente reste en liquidités.")
 
-    filtre = FiltreFondamental(mode, cours, comptes, financieres, note_min)
+    filtre = FiltreFondamental(mode, cours, comptes, financieres, note_min, valo)
     if strategie == STRAT_RSI:
         transactions, evolution = simuler_portefeuille(cours, tickers, filtre, debut, capital, mise,
                                                        seuil_achat, seuil_vente,
@@ -1674,8 +1741,11 @@ def page_test_historique():
                    "c'est-à-dire en sachant déjà qu'elles se portent bien.")
 
     if not transactions:
-        st.info("Aucun achat sur la période. Essayez des réglages moins stricts "
-                "(seuil d'achat plus haut, zone d'achat plus large ou sans filtre 200 WMA).")
+        conseil = ("Avec les filtres croissance / PER sur les comptes publiés avant l'achat, aucun achat n'est "
+                   "possible avant avril 2024 environ (avril 2026 pour la moyenne 3 ans). "
+                   if valo and valo["epoque"] else "")
+        st.info(f"Aucun achat sur la période. {conseil}Essayez des réglages moins stricts "
+                "(seuil d'achat plus haut, zone d'achat plus large, filtres plus souples).")
         return
 
     df = pd.DataFrame(transactions)
@@ -1701,12 +1771,15 @@ def page_test_historique():
     detail = df.sort_values("date", ascending=False).rename(columns={
         "date": "Achat le", "prix": "Prix achat", "montant": "Investi", "date_vente": "Vente le",
         "prix_vente": "Prix vente", "statut": "Statut", "note": "Note fond.", "rsi": "RSI achat",
-        "raison": "Raison", "repli": "Repli à l'achat %", "objectif": "Objectif", "stop": "Invalidation"})
+        "raison": "Raison", "repli": "Repli à l'achat %", "objectif": "Objectif", "stop": "Invalidation",
+        "ca_achat": "Croissance CA à l'achat %", "ratio_achat": "Ratio PER à l'achat"})
     colonnes = ["Ticker", "Nom", "Achat le", "Investi", "Gain €", "Rendement %", "Vente le", "Statut", "Raison",
                 "Durée (sem.)", "Prix achat", "Prix vente"]
     colonnes += ["RSI achat"] if strategie == STRAT_RSI else ["Repli à l'achat %", "Objectif", "Invalidation"]
     if mode != MODE_SANS_NOTE:
         colonnes.append("Note fond.")
+    if valo:
+        colonnes += ["Croissance CA à l'achat %", "Ratio PER à l'achat"]
     st.dataframe(detail[colonnes], hide_index=True, width="stretch", column_config={
         "Ticker": st.column_config.TextColumn(pinned=True),
         "Nom": st.column_config.TextColumn(width="medium"),
@@ -1718,6 +1791,8 @@ def page_test_historique():
         "RSI achat": st.column_config.NumberColumn(format="%.0f"),
         "Repli à l'achat %": st.column_config.NumberColumn(format="%.0f %%"),
         "Objectif": prix, "Invalidation": prix,
+        "Croissance CA à l'achat %": st.column_config.NumberColumn(format="%+.1f %%"),
+        "Ratio PER à l'achat": st.column_config.NumberColumn(format="%.2f"),
     })
 
     st.markdown("**Gain par action**")
